@@ -1,0 +1,372 @@
+# 🧬 BEREAN PROTOCOL: Complete Antibody Discovery Platform
+## User Guide for Dr. Sautto's Lab
+
+### 📋 Table of Contents
+1. [Overview](#overview)
+2. [Quick Start](#quick-start)
+3. [Module Architecture](#module-architecture)
+4. [Practical Workflows](#practical-workflows)
+5. [Real-World Examples](#real-world-examples)
+6. [Integration with Lab Equipment](#integration-with-lab-equipment)
+7. [Best Practices](#best-practices)
+
+---
+
+## 🎯 Overview
+
+The BEREAN Protocol is a comprehensive computational platform for antibody discovery and optimization, specifically designed for infectious disease targets. It integrates five powerful modules:
+
+1. **Binding Prediction** - ML-based antibody-antigen interaction prediction
+2. **Attention Analysis** - CDR identification and epitope mapping  
+3. **Variant Analysis** - Resistance prediction for known variants
+4. **GISAID Tracker** - Real-time monitoring of emerging variants
+5. **Cocktail Optimizer** - Multi-objective optimization for antibody combinations
+
+### Key Features for Your Research
+- **Multiplexed sequencing integration** - Process high-throughput antibody data
+- **Real-time variant monitoring** - Stay ahead of viral evolution
+- **Cocktail design** - Optimize combinations for maximum coverage
+- **Clinical translation** - Predict efficacy and plan development
+
+---
+
+## 🚀 Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/berean-protocol.git
+cd berean-protocol
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up GISAID credentials
+export GISAID_USERNAME="your_username"
+export GISAID_PASSWORD="your_password"
+```
+
+### Basic Usage
+
+```python
+from integrated_antibody_platform import AntibodyDiscoveryPlatform
+
+# Initialize platform
+platform = AntibodyDiscoveryPlatform()
+
+# Load your antibody sequences
+antibody_sequences = [
+    "QVQLVQSGAEVKKPGSSVKVSCKASGGTFSSYAISWVRQAPGKGLEWMG...",
+    "EVQLVESGGGLVQPGGSLRLSCAASGFTFSDYYMSWVRQAPGKGLEWVS...",
+    # ... your sequences from multiplexed sequencing
+]
+
+# Load antigen sequences
+antigen_sequences = [
+    "MFVFLVLLPLVSSQCVNLTTRTQLPPAYTNSFTRGVYYPDKVFRSSVLH...",  # Spike protein
+]
+
+# Run complete pipeline
+results = platform.run_complete_pipeline(
+    antibody_sequences=antibody_sequences,
+    antigen_sequences=antigen_sequences,
+    gisaid_metadata="path/to/gisaid_metadata.tsv"
+)
+
+# Access results
+optimal_cocktail = results['cocktails']['optimal_cocktail']
+print(f"Optimal cocktail: {optimal_cocktail}")
+```
+
+---
+
+## 🏗️ Module Architecture
+
+### Module Integration Flow
+```
+Sequencing Data → Binding Prediction → CDR/Epitope Analysis
+                                           ↓
+Clinical Planning ← Cocktail Design ← Variant Analysis
+                                           ↑
+                                    GISAID Monitoring
+```
+
+### Data Flow Example
+```python
+# 1. Process sequencing data
+from Bio import SeqIO
+
+sequences = []
+for record in SeqIO.parse("antibody_sequences.fasta", "fasta"):
+    sequences.append(str(record.seq))
+
+# 2. Screen for binding
+binding_results = platform.screen_antibodies(sequences)
+positive_binders = binding_results['passed_antibodies']
+
+# 3. Analyze variants
+variant_coverage = platform.analyze_variant_resistance(positive_binders)
+
+# 4. Design cocktail
+optimal_cocktail = platform.optimize_cocktail(
+    antibodies=variant_coverage['resistant_antibodies'],
+    max_size=3,
+    min_coverage=0.85
+)
+
+# 5. Generate report
+platform.generate_clinical_report(optimal_cocktail)
+```
+
+---
+
+## 💼 Practical Workflows
+
+### Workflow 1: Processing Multiplexed Antibody Sequencing
+
+```python
+def process_multiplexed_sequencing(fastq_file, barcode_map):
+    """
+    Process multiplexed sequencing data from Dr. Sautto's lab
+    """
+    from integrated_antibody_platform import AntibodyDiscoveryPlatform
+    import pandas as pd
+    
+    # Initialize platform
+    platform = AntibodyDiscoveryPlatform()
+    
+    # Parse sequencing data
+    sequences = parse_multiplexed_fastq(fastq_file, barcode_map)
+    
+    # Quality filter
+    high_quality = []
+    for seq in sequences:
+        if seq['quality_score'] > 30 and len(seq['sequence']) > 300:
+            high_quality.append(seq['sequence'])
+    
+    print(f"Processing {len(high_quality)} high-quality sequences")
+    
+    # Run analysis pipeline
+    results = platform.run_complete_pipeline(
+        antibody_sequences=high_quality,
+        antigen_sequences=["SPIKE_PROTEIN_SEQUENCE"],
+        gisaid_metadata="latest_gisaid.tsv"
+    )
+    
+    # Generate report for lab meeting
+    generate_lab_report(results)
+    
+    return results
+```
+
+### Workflow 2: Real-Time Variant Monitoring
+
+```python
+def setup_daily_surveillance():
+    """
+    Set up automated daily GISAID surveillance
+    """
+    from gisaid_variant_tracker import DailySurveillanceMonitor
+    
+    # Configure monitor
+    config = {
+        'credentials': {
+            'username': 'your_gisaid_username',
+            'password': 'your_gisaid_password'
+        },
+        'antibody_profiles': [
+            {'name': 'mAb-001', 'sequence': 'QVQLVQS...'},
+            {'name': 'mAb-002', 'sequence': 'EVQLVES...'}
+        ],
+        'alert_thresholds': {
+            'growth_rate': 0.5,
+            'geographic_spread': 5,
+            'escape_score': 0.7
+        }
+    }
+    
+    # Initialize monitor
+    monitor = DailySurveillanceMonitor(config)
+    
+    # Start automated monitoring
+    monitor.start_monitoring()
+```
+
+### Workflow 3: Cocktail Optimization for Clinical Development
+
+```python
+def design_clinical_cocktail(candidate_antibodies):
+    """
+    Design optimal cocktail for clinical development
+    """
+    from antibody_cocktail_optimizer import CocktailDesignPipeline
+    
+    # Define clinical constraints
+    constraints = {
+        'max_antibodies': 3,        # FDA preference
+        'max_cost': 500,           # $/dose target
+        'min_coverage': 0.85,      # 85% variant coverage
+        'max_immunogenicity': 0.2  # Safety threshold
+    }
+    
+    # Initialize optimizer
+    pipeline = CocktailDesignPipeline()
+    
+    # Run optimization
+    results = pipeline.design_optimal_cocktail(
+        antibody_library=candidate_antibodies,
+        variants=get_current_variants(),
+        constraints=constraints
+    )
+    
+    # Get optimal cocktail
+    best = results['best_cocktail']
+    
+    print(f"\nOptimal Clinical Cocktail:")
+    print(f"Antibodies: {[ab.id for ab in best.antibodies]}")
+    print(f"Coverage: {best.coverage_score:.1%}")
+    print(f"Resistance Barrier: {best.resistance_barrier:.2f}")
+    print(f"Predicted Efficacy: {best.predicted_efficacy:.1%}")
+    
+    # Generate IND package
+    generate_ind_documentation(best)
+    
+    return best
+```
+
+---
+
+## 🔬 Real-World Examples
+
+### Example 1: Influenza Antibody Discovery
+
+```python
+# Analyzing antibodies against influenza HA
+influenza_pipeline = AntibodyDiscoveryPlatform()
+
+# Load HA sequences from different strains
+ha_sequences = {
+    'H1N1': load_sequence('H1N1_HA.fasta'),
+    'H3N2': load_sequence('H3N2_HA.fasta'),
+    'H5N1': load_sequence('H5N1_HA.fasta')
+}
+
+# Screen antibodies against multiple strains
+cross_reactive = []
+for antibody in antibody_library:
+    reactive_strains = 0
+    for strain, ha_seq in ha_sequences.items():
+        if predict_binding(antibody, ha_seq) > 0.7:
+            reactive_strains += 1
+    
+    if reactive_strains >= 2:  # Cross-reactive
+        cross_reactive.append(antibody)
+
+print(f"Found {len(cross_reactive)} cross-reactive antibodies")
+```
+
+### Example 2: RSV F Protein Antibodies
+
+```python
+# Analyzing antibodies against RSV F protein
+rsv_analysis = {
+    'prefusion': analyze_prefusion_binders(antibody_sequences),
+    'postfusion': analyze_postfusion_binders(antibody_sequences),
+    'site_0': analyze_site0_antibodies(antibody_sequences),
+    'site_II': analyze_siteII_antibodies(antibody_sequences)
+}
+
+# Select antibodies targeting conserved epitopes
+conserved_binders = rsv_analysis['site_0'] + rsv_analysis['site_II']
+```
+
+### Example 3: SARS-CoV-2 Variant Analysis
+
+```python
+# Real-time analysis of emerging variant
+def analyze_new_variant(variant_name, spike_mutations):
+    """
+    Rapid assessment of new variant impact
+    """
+    results = {}
+    
+    # Test current antibody panel
+    for antibody in current_panel:
+        # Predict neutralization
+        predicted_ic50 = predict_variant_neutralization(
+            antibody, spike_mutations
+        )
+        
+        # Calculate fold change
+        fold_change = predicted_ic50 / antibody.wildtype_ic50
+        
+        results[antibody.id] = {
+            'predicted_ic50': predicted_ic50,
+            'fold_change': fold_change,
+            'maintains_efficacy': fold_change < 5
+        }
+    
+    # Identify vulnerable antibodies
+    vulnerable = [ab for ab, data in results.items() 
+                  if not data['maintains_efficacy']]
+    
+    if len(vulnerable) > len(current_panel) / 2:
+        trigger_alert(f"WARNING: {variant_name} escapes >50% of panel")
+    
+    return results
+
+# Example: Analyze new variant
+new_variant_results = analyze_new_variant(
+    "BA.2.87.1",
+    ["S:R346T", "S:F486P", "S:F490S"]
+)
+```
+
+---
+
+## 🔧 Integration with Lab Equipment
+
+### Connecting to Sequencers
+
+```python
+# Integration with Illumina MiSeq
+def process_miseq_run(run_folder):
+    """
+    Process antibody sequencing run from MiSeq
+    """
+    # Parse BCL files
+    from illumina import BCLParser
+    parser = BCLParser(run_folder)
+    
+    # Demultiplex samples
+    samples = parser.demultiplex(
+        barcode_file="barcodes.csv",
+        mismatch_threshold=1
+    )
+    
+    # Quality filtering
+    filtered_reads = []
+    for sample in samples:
+        for read in sample.reads:
+            if read.average_quality > 30:
+                filtered_reads.append(read.sequence)
+    
+    # Run through pipeline
+    results = platform.run_complete_pipeline(filtered_reads)
+    
+    return results
+```
+
+### LIMS Integration
+
+```python
+# Connect to Laboratory Information Management System
+class LIMSConnector:
+    def __init__(self, lims_url, api_key):
+        self.lims_url = lims_url
+        self.api_key = api_key
+    
+    def upload_results(self, antibody_results):
+        """Upload analysis results to LIMS"""
+        

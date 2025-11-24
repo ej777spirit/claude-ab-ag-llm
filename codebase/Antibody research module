@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL v2: Advanced Antibody Discovery Module
+Enhanced with attention visualization, CDR analysis, and structural integration
+
+Features:
+- Attention weight extraction for binding site prediction
+- CDR (Complementarity-Determining Region) analysis
+- Structural feature integration (if PDB available)
+- Epitope-paratope interaction mapping
+- Cross-reactivity prediction module
+
+Author: EJ
+Date: November 2024
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass
+import re
+from scipy.spatial.distance import cdist
+import warnings
+warnings.filterwarnings('ignore')
+
+# For structure handling (optional)
+try:
+    from Bio import SeqIO, PDB
+    from Bio.PDB import PDBParser, DSSP
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+    print("BioPython not found. Structural features will be limited.")
+
+# ==========================================
+# 1. ANTIBODY-SPECIFIC UTILITIES
+# ==========================================
+
+@dataclass
+class AntibodyRegions:
+    """Stores antibody region annotations"""
+    heavy_chain: str
+    light_chain: str
+    cdr_h1: Tuple[int, int]
+    cdr_h2: Tuple[int, int] 
+    cdr_h3: Tuple[int, int]
+    cdr_l1: Tuple[int, int]
+    cdr_l2: Tuple[int, int]
+    cdr_l3: Tuple[int, int]
+    framework_regions: List[Tuple[int, int]]
+
+class CDRAnnotator:
+    """
+    Identifies CDR regions using IMGT, Kabat, or Chothia numbering schemes
+    """
+    
+    # IMGT CDR definitions (approximate positions)
+    IMGT_CDR_POSITIONS = {
+        'H1': (26, 35),
+        'H2': (51, 57),
+        'H3': (93, 102),
+        'L1': (27, 32),
+        'L2': (50, 52),
+        'L3': (89, 97)
+    }
+    
+    @staticmethod
+    def find_cdr_regions(sequence: str, chain_type: str = 'heavy') -> Dict[str, Tuple[int, int]]:
+        """
+        Identifies CDR regions in an antibody sequence.
+        This is a simplified version - production would use ANARCI or similar.
+        """
+        cdrs = {}
+        
+        # Use regex patterns for common CDR motifs
+        if chain_type == 'heavy':
+            # Simplified patterns - real implementation would be more sophisticated
+            cdr_h1_pattern = r'C[A-Z]{8,12}W'  # CDR-H1 typically between Cys and Trp
+            cdr_h2_pattern = r'[LI][A-Z]{14,19}[KR]'  # CDR-H2 
+            cdr_h3_pattern = r'C[A-Z]{3,25}W'  # CDR-H3 is most variable
+            
+            # Find matches
+            for match in re.finditer(cdr_h1_pattern, sequence):
+                cdrs['CDR-H1'] = (match.start() + 1, match.end() - 1)
+                break
+                
+            for match in re.finditer(cdr_h2_pattern, sequence):
+                cdrs['CDR-H2'] = (match.start() + 1, match.end() - 1)
+                break
+                
+            for match in re.finditer(cdr_h3_pattern, sequence):
+                if match.start() > 80:  # CDR-H3 is typically after position 80
+                    cdrs['CDR-H3'] = (match.start() + 1, match.end() - 1)
+                    break
+        
+        else:  # light chain
+            # Simplified light chain CDR patterns
+            cdrs['CDR-L1'] = (24, 34)  # Default positions
+            cdrs['CDR-L2'] = (50, 56)
+            cdrs['CDR-L3'] = (89, 97)
+        
+        return cdrs
+
+class StructuralFeatureExtractor:
+    """
+    Extracts structural features from PDB files if available
+    """
+    
+    def __init__(self):
+        self.parser = PDBParser(QUIET=True) if BIOPYTHON_AVAILABLE else None
+    
+    def extract_features(self, pdb_file: str) -> Dict[str, np.ndarray]:
+        """
+        Extract structural features from PDB file
+        """
+        if not BIOPYTHON_AVAILABLE or not os.path.exists(pdb_file):
+            return self._get_default_features()
+        
+        structure = self.parser.get_structure("antibody", pdb_file)
+        
+        features = {
+            'ca_distances': self._calculate_ca_distances(structure),
+            'surface_accessibility': self._estimate_sasa(structure),
+            'secondary_structure': self._get_secondary_structure(structure),
+            'contact_map': self._generate_contact_map(structure)
+        }
+        
+        return features
+    
+    def _calculate_ca_distances(self, structure) -> np.ndarray:
+        """Calculate pairwise Cα distances"""
+        ca_atoms = []
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    if 'CA' in residue:
+                        ca_atoms.append(residue['CA'].coord)
+        
+        if ca_atoms:
+            return cdist(ca_atoms, ca_atoms)
+        return np.array([])
+    
+    def _estimate_sasa(self, structure) -> np.ndarray:
+        """Estimate solvent accessible surface area"""
+        # Simplified - would use DSSP or similar in production
+        return np.random.rand(len(list(structure.get_residues())))
+    
+    def _get_secondary_structure(self, structure) -> Dict:
+        """Get secondary structure elements"""
+        # Would use DSSP in production
+        return {'helix': [], 'sheet': [], 'coil': []}
+    
+    def _generate_contact_map(self, structure) -> np.ndarray:
+        """Generate residue contact map"""
+        distances = self._calculate_ca_distances(structure)
+        if distances.size > 0:
+            contact_map = (distances < 8.0).astype(float)  # 8Å cutoff
+            return contact_map
+        return np.array([])
+    
+    def _get_default_features(self) -> Dict:
+        """Return default features when structure not available"""
+        return {
+            'ca_distances': np.array([]),
+            'surface_accessibility': np.array([]),
+            'secondary_structure': {},
+            'contact_map': np.array([])
+        }
+
+# ==========================================
+# 2. ENHANCED NEURAL ARCHITECTURE WITH ATTENTION
+# ==========================================
+
+class AttentionExtractor(nn.Module):
+    """
+    Module to extract and analyze attention weights for interpretability
+    """
+    
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.attention_weights = None
+        
+    def forward(self, attention_outputs):
+        """Store attention weights for later visualization"""
+        if hasattr(attention_outputs, 'attentions'):
+            self.attention_weights = attention_outputs.attentions
+        return attention_outputs
+
+class AntibodyBindingPredictor(nn.Module):
+    """
+    Enhanced model with attention visualization and CDR-aware processing
+    """
+    
+    def __init__(self, 
+                 hidden_size: int = 768,
+                 num_heads: int = 12,
+                 num_layers: int = 6,
+                 dropout: float = 0.1,
+                 use_cdr_attention: bool = True,
+                 use_structural_features: bool = False):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.use_cdr_attention = use_cdr_attention
+        self.use_structural_features = use_structural_features
+        
+        # Sequence encoder (replacing MAMMAL for demo)
+        self.embedding = nn.Embedding(30, hidden_size)  # 30 for amino acids + special tokens
+        
+        # Positional encoding
+        self.positional_encoding = self._create_positional_encoding(1000, hidden_size)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # CDR-specific attention module
+        if use_cdr_attention:
+            self.cdr_attention = nn.MultiheadAttention(
+                hidden_size, num_heads, dropout=dropout, batch_first=True
+            )
+            self.cdr_gate = nn.Sequential(
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.Sigmoid()
+            )
+        
+        # Structural feature integration
+        if use_structural_features:
+            self.struct_encoder = nn.Sequential(
+                nn.Linear(100, 256),  # 100 is placeholder for structural feature dim
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(256, hidden_size)
+            )
+            self.struct_gate = nn.Sigmoid()
+        
+        # Cross-attention for antibody-antigen interaction
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Prediction heads
+        self.binding_classifier = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 1)
+        )
+        
+        # Epitope prediction head (predicts binding sites)
+        self.epitope_predictor = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        
+        # Cross-reactivity prediction head
+        self.cross_reactivity_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10)  # Predict reactivity to 10 common antigens
+        )
+        
+        # For attention weight extraction
+        self.attention_weights = {}
+    
+    def _create_positional_encoding(self, max_len: int, d_model: int) -> nn.Parameter:
+        """Create sinusoidal positional encoding"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * 
+                           -(np.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return nn.Parameter(pe.unsqueeze(0), requires_grad=False)
+    
+    def encode_sequence(self, seq_tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Encode amino acid sequence"""
+        batch_size, seq_len = seq_tokens.shape
+        
+        # Embed tokens
+        x = self.embedding(seq_tokens)
+        
+        # Add positional encoding
+        x = x + self.positional_encoding[:, :seq_len, :]
+        
+        # Transform
+        x = self.transformer(x, src_key_padding_mask=~mask.bool())
+        
+        return x
+    
+    def apply_cdr_attention(self, 
+                          sequence_encoding: torch.Tensor,
+                          cdr_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply special attention to CDR regions"""
+        if not self.use_cdr_attention or cdr_mask is None:
+            return sequence_encoding
+        
+        # Self-attention focused on CDR regions
+        cdr_features, attn_weights = self.cdr_attention(
+            sequence_encoding, sequence_encoding, sequence_encoding,
+            key_padding_mask=cdr_mask
+        )
+        
+        # Store attention weights for visualization
+        self.attention_weights['cdr_attention'] = attn_weights.detach()
+        
+        # Gated combination
+        gate = self.cdr_gate(torch.cat([sequence_encoding, cdr_features], dim=-1))
+        enhanced_features = gate * cdr_features + (1 - gate) * sequence_encoding
+        
+        return enhanced_features
+    
+    def forward(self, 
+                antibody_tokens: torch.Tensor,
+                antigen_tokens: torch.Tensor,
+                antibody_mask: torch.Tensor,
+                antigen_mask: torch.Tensor,
+                cdr_mask: Optional[torch.Tensor] = None,
+                structural_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass with multiple outputs
+        
+        Returns:
+            Dictionary containing:
+            - binding_prob: Probability of binding
+            - epitope_scores: Per-residue epitope scores
+            - cross_reactivity: Cross-reactivity predictions
+            - attention_weights: Attention maps for visualization
+        """
+        
+        # Encode sequences
+        antibody_enc = self.encode_sequence(antibody_tokens, antibody_mask)
+        antigen_enc = self.encode_sequence(antigen_tokens, antigen_mask)
+        
+        # Apply CDR-specific attention
+        antibody_enc = self.apply_cdr_attention(antibody_enc, cdr_mask)
+        
+        # Integrate structural features if available
+        if self.use_structural_features and structural_features is not None:
+            struct_enc = self.struct_encoder(structural_features)
+            struct_gate = self.struct_gate(struct_enc)
+            antibody_enc = antibody_enc + struct_gate.unsqueeze(1) * struct_enc.unsqueeze(1)
+        
+        # Cross-attention between antibody and antigen
+        interaction_features, cross_attn_weights = self.cross_attention(
+            antibody_enc, antigen_enc, antigen_enc,
+            key_padding_mask=~antigen_mask.bool()
+        )
+        
+        # Store cross-attention weights
+        self.attention_weights['cross_attention'] = cross_attn_weights.detach()
+        
+        # Global pooling for sequence-level prediction
+        # Masked mean pooling
+        ab_mask_expanded = antibody_mask.unsqueeze(-1).float()
+        ab_sum = (interaction_features * ab_mask_expanded).sum(dim=1)
+        ab_mean = ab_sum / ab_mask_expanded.sum(dim=1).clamp(min=1e-9)
+        
+        # Predictions
+        binding_logit = self.binding_classifier(ab_mean)
+        binding_prob = torch.sigmoid(binding_logit)
+        
+        # Per-residue epitope scores (on antigen)
+        epitope_scores = self.epitope_predictor(antigen_enc).squeeze(-1)
+        epitope_scores = torch.sigmoid(epitope_scores) * antigen_mask.float()
+        
+        # Cross-reactivity predictions
+        cross_reactivity = torch.sigmoid(self.cross_reactivity_head(ab_mean))
+        
+        return {
+            'binding_prob': binding_prob,
+            'epitope_scores': epitope_scores,
+            'cross_reactivity': cross_reactivity,
+            'attention_weights': self.attention_weights
+        }
+
+# ==========================================
+# 3. ATTENTION VISUALIZATION
+# ==========================================
+
+class AttentionVisualizer:
+    """
+    Visualize attention patterns for interpretability
+    """
+    
+    @staticmethod
+    def plot_attention_heatmap(attention_weights: torch.Tensor,
+                              antibody_seq: str,
+                              antigen_seq: str,
+                              save_path: str = "attention_map.png"):
+        """
+        Create heatmap of attention weights between antibody and antigen
+        """
+        # Convert to numpy
+        if isinstance(attention_weights, torch.Tensor):
+            attention_weights = attention_weights.cpu().numpy()
+        
+        # Handle multi-head attention (average across heads)
+        if len(attention_weights.shape) > 2:
+            attention_weights = attention_weights.mean(axis=0)
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Create heatmap
+        sns.heatmap(attention_weights, 
+                   xticklabels=list(antigen_seq),
+                   yticklabels=list(antibody_seq),
+                   cmap='YlOrRd',
+                   cbar_kws={'label': 'Attention Weight'},
+                   ax=ax)
+        
+        ax.set_xlabel('Antigen Residues', fontsize=12)
+        ax.set_ylabel('Antibody Residues', fontsize=12)
+        ax.set_title('Antibody-Antigen Attention Map', fontsize=14)
+        
+        # Highlight CDR regions if available
+        # This would be enhanced with actual CDR positions
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
+    @staticmethod
+    def plot_epitope_prediction(epitope_scores: np.ndarray,
+                               antigen_seq: str,
+                               threshold: float = 0.5,
+                               save_path: str = "epitope_prediction.png"):
+        """
+        Visualize predicted epitope regions on antigen
+        """
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 6))
+        
+        positions = np.arange(len(antigen_seq))
+        
+        # Bar plot of epitope scores
+        colors = ['red' if score > threshold else 'blue' 
+                 for score in epitope_scores]
+        ax1.bar(positions, epitope_scores, color=colors, alpha=0.7)
+        ax1.axhline(y=threshold, color='black', linestyle='--', label=f'Threshold ({threshold})')
+        ax1.set_xlabel('Position')
+        ax1.set_ylabel('Epitope Score')
+        ax1.set_title('Predicted Epitope Regions')
+        ax1.legend()
+        
+        # Sequence view with highlights
+        ax2.set_xlim(0, len(antigen_seq))
+        ax2.set_ylim(0, 1)
+        
+        for i, (aa, score) in enumerate(zip(antigen_seq, epitope_scores)):
+            color = 'red' if score > threshold else 'lightgray'
+            alpha = min(1.0, score + 0.3)
+            ax2.text(i + 0.5, 0.5, aa, ha='center', va='center',
+                    fontsize=8, color='black',
+                    bbox=dict(boxstyle='round,pad=0.3', 
+                            facecolor=color, alpha=alpha))
+        
+        ax2.set_xlabel('Antigen Sequence')
+        ax2.set_title('Epitope Mapping on Sequence')
+        ax2.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
+    @staticmethod
+    def plot_cdr_importance(attention_weights: Dict[str, np.ndarray],
+                           cdr_positions: Dict[str, Tuple[int, int]],
+                           save_path: str = "cdr_importance.png"):
+        """
+        Visualize importance of different CDR regions
+        """
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        cdr_importance = {}
+        
+        # Calculate average attention for each CDR
+        for cdr_name, (start, end) in cdr_positions.items():
+            if 'cdr_attention' in attention_weights:
+                weights = attention_weights['cdr_attention']
+                if isinstance(weights, torch.Tensor):
+                    weights = weights.cpu().numpy()
+                
+                # Extract CDR-specific weights
+                cdr_weights = weights[:, start:end, :].mean()
+                cdr_importance[cdr_name] = cdr_weights
+        
+        if cdr_importance:
+            cdrs = list(cdr_importance.keys())
+            importance = list(cdr_importance.values())
+            
+            colors = plt.cm.Set3(np.linspace(0, 1, len(cdrs)))
+            bars = ax.bar(cdrs, importance, color=colors)
+            
+            ax.set_xlabel('CDR Region', fontsize=12)
+            ax.set_ylabel('Average Attention Weight', fontsize=12)
+            ax.set_title('CDR Region Importance for Binding', fontsize=14)
+            
+            # Add value labels on bars
+            for bar, val in zip(bars, importance):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{val:.3f}', ha='center', va='bottom')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 4. CROSS-REACTIVITY ANALYZER
+# ==========================================
+
+class CrossReactivityAnalyzer:
+    """
+    Analyze potential cross-reactivity with common antigens
+    """
+    
+    # Common antigen epitopes for testing cross-reactivity
+    COMMON_ANTIGENS = {
+        'Influenza_HA': 'GLFGAIAGFIEGGWTGMVDGWYGYHHQNEQGSGYAADLKSTQNAIDEITNKVNSVIEKMNTQFTAVGKEFNHLE',
+        'SARS_CoV2_Spike': 'RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFT',
+        'HIV_gp120': 'VKLTPLCVTLNCTDLGNATNTNSSNWKEGEIKNCSFNITTSIRDKVQKEYALFYKLDVVPIDNTSYRLISCNTSV',
+        'RSV_F': 'MELPILKTNAITTILAAVTLCFASSQNITEEFYQSTCSAVSKGYLSALRTGWYTSVITIELSNIKENKCNGTDAK',
+        'EBV_gp350': 'TGHGARTTDPGKPSAAPGRRTRPRTKPSNPRRRRPRPSTSSQSSIAETEWTGFNHSDHDLGRNGGDPGQQDPQQL',
+        'HSV_gD': 'KRPPNTPPPRAPRTPRSPPASPTPPGTPNAPAPRAPTPTPRPPTTPSRPAPGTPAGGAAAGASATGNRTVSNASM',
+        'HBV_HBsAg': 'MENITSGFLGPLLVLQAGFLLTRILTIPQSLDSWWTSLNFLGGTTVCLAYHQDALAPHTAAVRSYLRTGSPSAL',
+        'Dengue_E': 'MRCVGIGNRDFVEGLSGATWVDVVLEHGSCVTTMAKDKPTLDIELLKTEVTNPAVLRKLCIEAKISNTTTDSRC',
+        'Malaria_CSP': 'NANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNANPNA',
+        'Tetanus_toxoid': 'MPITINNFRYSDPVNNDTIIMMEPPYCKGLDIYYKAFKITDRIWIVPERYEFGTKPEDFNPSSGLVNITFDIPF'
+    }
+    
+    @classmethod
+    def analyze_cross_reactivity(cls, 
+                                model: nn.Module,
+                                antibody_seq: str,
+                                tokenizer=None) -> pd.DataFrame:
+        """
+        Test antibody against panel of common antigens
+        """
+        results = []
+        
+        for antigen_name, antigen_seq in cls.COMMON_ANTIGENS.items():
+            # Tokenize sequences (mock tokenization for demo)
+            ab_tokens = torch.tensor([ord(c) % 20 + 1 for c in antibody_seq]).unsqueeze(0)
+            ag_tokens = torch.tensor([ord(c) % 20 + 1 for c in antigen_seq]).unsqueeze(0)
+            ab_mask = torch.ones_like(ab_tokens)
+            ag_mask = torch.ones_like(ag_tokens)
+            
+            # Get predictions
+            with torch.no_grad():
+                outputs = model(ab_tokens, ag_tokens, ab_mask, ag_mask)
+                binding_prob = outputs['binding_prob'].item()
+            
+            results.append({
+                'Antigen': antigen_name,
+                'Binding_Probability': binding_prob,
+                'Risk_Level': cls._categorize_risk(binding_prob)
+            })
+        
+        df = pd.DataFrame(results)
+        return df.sort_values('Binding_Probability', ascending=False)
+    
+    @staticmethod
+    def _categorize_risk(prob: float) -> str:
+        """Categorize cross-reactivity risk"""
+        if prob > 0.7:
+            return "High"
+        elif prob > 0.3:
+            return "Medium"
+        else:
+            return "Low"
+    
+    @staticmethod
+    def plot_cross_reactivity_profile(results_df: pd.DataFrame,
+                                     save_path: str = "cross_reactivity.png"):
+        """
+        Visualize cross-reactivity profile
+        """
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Bar plot
+        colors = {'High': 'red', 'Medium': 'orange', 'Low': 'green'}
+        bar_colors = [colors[risk] for risk in results_df['Risk_Level']]
+        
+        ax1.barh(results_df['Antigen'], results_df['Binding_Probability'], 
+                color=bar_colors, alpha=0.7)
+        ax1.set_xlabel('Binding Probability')
+        ax1.set_title('Cross-Reactivity Profile')
+        ax1.set_xlim(0, 1)
+        
+        # Risk distribution pie chart
+        risk_counts = results_df['Risk_Level'].value_counts()
+        ax2.pie(risk_counts.values, labels=risk_counts.index, autopct='%1.1f%%',
+               colors=[colors[risk] for risk in risk_counts.index])
+        ax2.set_title('Risk Distribution')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 5. INTEGRATED ANALYSIS PIPELINE
+# ==========================================
+
+class AntibodyAnalysisPipeline:
+    """
+    Complete pipeline for antibody analysis
+    """
+    
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.cdr_annotator = CDRAnnotator()
+        self.visualizer = AttentionVisualizer()
+        self.cross_analyzer = CrossReactivityAnalyzer()
+        self.struct_extractor = StructuralFeatureExtractor()
+    
+    def comprehensive_analysis(self,
+                              antibody_seq: str,
+                              antigen_seq: str,
+                              pdb_file: Optional[str] = None) -> Dict:
+        """
+        Run complete analysis pipeline
+        """
+        print("=" * 60)
+        print("COMPREHENSIVE ANTIBODY ANALYSIS")
+        print("=" * 60)
+        
+        results = {}
+        
+        # 1. CDR Annotation
+        print("\n1. Identifying CDR regions...")
+        cdr_heavy = self.cdr_annotator.find_cdr_regions(antibody_seq, 'heavy')
+        results['cdr_regions'] = cdr_heavy
+        print(f"   Found {len(cdr_heavy)} CDR regions")
+        
+        # 2. Structural features (if available)
+        if pdb_file:
+            print("\n2. Extracting structural features...")
+            struct_features = self.struct_extractor.extract_features(pdb_file)
+            results['structural_features'] = struct_features
+            print("   Structural features extracted")
+        else:
+            struct_features = None
+            print("\n2. No PDB file provided, skipping structural analysis")
+        
+        # 3. Binding prediction
+        print("\n3. Predicting binding affinity...")
+        
+        # Tokenize (mock for demo)
+        ab_tokens = torch.tensor([ord(c) % 20 + 1 for c in antibody_seq]).unsqueeze(0)
+        ag_tokens = torch.tensor([ord(c) % 20 + 1 for c in antigen_seq]).unsqueeze(0)
+        ab_mask = torch.ones_like(ab_tokens)
+        ag_mask = torch.ones_like(ag_tokens)
+        
+        # Get predictions
+        with torch.no_grad():
+            outputs = self.model(ab_tokens, ag_tokens, ab_mask, ag_mask)
+        
+        binding_prob = outputs['binding_prob'].item()
+        results['binding_probability'] = binding_prob
+        print(f"   Binding probability: {binding_prob:.3f}")
+        
+        # 4. Epitope prediction
+        print("\n4. Identifying potential epitopes...")
+        epitope_scores = outputs['epitope_scores'].squeeze().cpu().numpy()
+        epitope_residues = np.where(epitope_scores > 0.5)[0]
+        results['epitope_residues'] = epitope_residues.tolist()
+        print(f"   Predicted {len(epitope_residues)} epitope residues")
+        
+        # 5. Cross-reactivity analysis
+        print("\n5. Analyzing cross-reactivity...")
+        cross_react_df = self.cross_analyzer.analyze_cross_reactivity(
+            self.model, antibody_seq
+        )
+        results['cross_reactivity'] = cross_react_df
+        high_risk = (cross_react_df['Risk_Level'] == 'High').sum()
+        print(f"   High-risk cross-reactivity: {high_risk} antigens")
+        
+        # 6. Generate visualizations
+        print("\n6. Generating visualizations...")
+        
+        # Attention heatmap
+        if 'cross_attention' in outputs['attention_weights']:
+            self.visualizer.plot_attention_heatmap(
+                outputs['attention_weights']['cross_attention'].squeeze(),
+                antibody_seq[:50],  # Truncate for visualization
+                antigen_seq[:50],
+                save_path="attention_map.png"
+            )
+        
+        # Epitope visualization
+        self.visualizer.plot_epitope_prediction(
+            epitope_scores[:100],  # First 100 residues
+            antigen_seq[:100],
+            save_path="epitope_map.png"
+        )
+        
+        # Cross-reactivity profile
+        self.cross_analyzer.plot_cross_reactivity_profile(
+            cross_react_df,
+            save_path="cross_reactivity.png"
+        )
+        
+        # CDR importance
+        if cdr_heavy:
+            self.visualizer.plot_cdr_importance(
+                outputs['attention_weights'],
+                cdr_heavy,
+                save_path="cdr_importance.png"
+            )
+        
+        print("\n" + "=" * 60)
+        print("ANALYSIS COMPLETE")
+        print("=" * 60)
+        
+        # Summary report
+        self._generate_report(results)
+        
+        return results
+    
+    def _generate_report(self, results: Dict):
+        """Generate a summary report"""
+        
+        report = f"""
+ANTIBODY BINDING ANALYSIS REPORT
+================================
+
+1. BINDING PREDICTION
+   - Probability: {results['binding_probability']:.3f}
+   - Classification: {'Positive' if results['binding_probability'] > 0.5 else 'Negative'}
+
+2. CDR REGIONS IDENTIFIED
+"""
+        for cdr, pos in results.get('cdr_regions', {}).items():
+            report += f"   - {cdr}: positions {pos[0]}-{pos[1]}\n"
+        
+        report += f"""
+3. EPITOPE MAPPING
+   - Number of epitope residues: {len(results.get('epitope_residues', []))}
+   - Positions: {results.get('epitope_residues', [])[:10]}{'...' if len(results.get('epitope_residues', [])) > 10 else ''}
+
+4. CROSS-REACTIVITY RISK
+"""
+        if 'cross_reactivity' in results:
+            risk_summary = results['cross_reactivity']['Risk_Level'].value_counts()
+            for risk, count in risk_summary.items():
+                report += f"   - {risk}: {count} antigens\n"
+        
+        report += """
+5. VISUALIZATION FILES GENERATED
+   - attention_map.png: Antibody-antigen interaction heatmap
+   - epitope_map.png: Predicted epitope regions
+   - cross_reactivity.png: Cross-reactivity profile
+   - cdr_importance.png: CDR region importance scores
+        """
+        
+        print(report)
+        
+        # Save report
+        with open("analysis_report.txt", "w") as f:
+            f.write(report)
+
+# ==========================================
+# 6. EXAMPLE USAGE
+# ==========================================
+
+def demo_analysis():
+    """
+    Demonstration of the complete antibody analysis pipeline
+    """
+    
+    # Sample antibody sequence (simplified)
+    antibody_seq = """
+    EVQLVESGGGLVQPGGSLRLSCAASGFTFSDYYMSWVRQAPGKGLEWVSYISSSSSTIYYADSVKG
+    RFTISRDNSKNTLYLQMNSLRAEDTAVYYCARDGYSGSEDYWGQGTLVTVSS
+    """.replace("\n", "").replace(" ", "")
+    
+    # Sample antigen sequence
+    antigen_seq = """
+    MKTIIALSYIFCLALGQDLPGNDNSTATLCLGHHAVPNGTLVKTITDDQIEVTNATELVQSSSTGK
+    ICNNPHRILDGIDCTLIDALLGDPHCDVFQNETWDLFVERSKAFSNCYPYDVPDYASLRSLVASSG
+    """.replace("\n", "").replace(" ", "")
+    
+    print("Initializing model...")
+    model = AntibodyBindingPredictor(
+        hidden_size=768,
+        use_cdr_attention=True,
+        use_structural_features=False
+    )
+    model.eval()
+    
+    print("Setting up analysis pipeline...")
+    pipeline = AntibodyAnalysisPipeline(model)
+    
+    print("\nRunning comprehensive analysis...")
+    results = pipeline.comprehensive_analysis(
+        antibody_seq=antibody_seq,
+        antigen_seq=antigen_seq,
+        pdb_file=None  # Would provide actual PDB file path if available
+    )
+    
+    print("\n✓ Analysis complete! Check generated files for visualizations.")
+    
+    return results
+
+if __name__ == "__main__":
+    # Run demo
+    results = demo_analysis()

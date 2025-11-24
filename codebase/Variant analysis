@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL v3: Variant Analysis Module
+Advanced capabilities for viral variant analysis and antibody escape prediction
+
+Features:
+- Viral variant impact assessment
+- Escape mutation prediction
+- Neutralization breadth calculation
+- Phylogenetic distance analysis
+- Variant-specific epitope mapping
+- Timeline evolution tracking
+
+Author: EJ
+Date: November 2024
+"""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import json
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import pdist, squareform
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import networkx as nx
+from itertools import combinations
+warnings.filterwarnings('ignore')
+
+# Bio libraries for sequence analysis
+try:
+    from Bio import AlignIO, Phylo, SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Align import MultipleSeqAlignment
+    from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+    from Bio.SubsMat import MatrixInfo as matlist
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+    print("BioPython not available. Some features will be limited.")
+
+# ==========================================
+# 1. VARIANT DATA STRUCTURES
+# ==========================================
+
+@dataclass
+class ViralVariant:
+    """Represents a viral variant with mutations and metadata"""
+    name: str
+    lineage: str
+    mutations: List[str]  # Format: "S:E484K" (protein:original_pos_mutant)
+    spike_mutations: List[str]
+    emergence_date: Optional[datetime] = None
+    prevalence: float = 0.0
+    geographical_origin: str = ""
+    parent_lineage: Optional[str] = None
+    who_designation: Optional[str] = None  # VOC, VOI, VUM
+    key_features: Dict[str, any] = field(default_factory=dict)
+    
+    def get_mutation_positions(self, protein: str = "S") -> List[int]:
+        """Extract mutation positions for a specific protein"""
+        positions = []
+        for mut in self.mutations:
+            if mut.startswith(f"{protein}:"):
+                # Extract position from format like "S:E484K"
+                pos_str = ''.join(filter(str.isdigit, mut.split(':')[1]))
+                if pos_str:
+                    positions.append(int(pos_str))
+        return positions
+
+@dataclass
+class AntibodyProfile:
+    """Antibody neutralization profile across variants"""
+    antibody_id: str
+    antibody_seq: str
+    variant_neutralization: Dict[str, float]  # variant_name -> IC50
+    breadth_score: float = 0.0
+    potency_score: float = 0.0
+    resistance_mutations: List[str] = field(default_factory=list)
+    epitope_bins: List[str] = field(default_factory=list)
+
+# ==========================================
+# 2. VARIANT DATABASE
+# ==========================================
+
+class VariantDatabase:
+    """
+    Database of known variants with their characteristics
+    Includes major SARS-CoV-2 variants as examples
+    """
+    
+    SARS_COV2_VARIANTS = {
+        'Wild Type': ViralVariant(
+            name='Wild Type',
+            lineage='A',
+            mutations=[],
+            spike_mutations=[],
+            emergence_date=datetime(2019, 12, 1),
+            who_designation='Reference'
+        ),
+        'Alpha': ViralVariant(
+            name='Alpha',
+            lineage='B.1.1.7',
+            mutations=['S:N501Y', 'S:D614G', 'S:P681H', 'S:T716I', 'S:S982A', 'S:D1118H'],
+            spike_mutations=['N501Y', 'D614G', 'P681H', 'del69-70', 'del144'],
+            emergence_date=datetime(2020, 9, 1),
+            who_designation='VOC'
+        ),
+        'Beta': ViralVariant(
+            name='Beta',
+            lineage='B.1.351',
+            mutations=['S:K417N', 'S:E484K', 'S:N501Y', 'S:D614G', 'S:A701V'],
+            spike_mutations=['K417N', 'E484K', 'N501Y', 'D614G', 'A701V'],
+            emergence_date=datetime(2020, 10, 1),
+            who_designation='VOC'
+        ),
+        'Gamma': ViralVariant(
+            name='Gamma',
+            lineage='P.1',
+            mutations=['S:K417T', 'S:E484K', 'S:N501Y', 'S:D614G', 'S:H655Y'],
+            spike_mutations=['K417T', 'E484K', 'N501Y', 'D614G', 'H655Y'],
+            emergence_date=datetime(2020, 12, 1),
+            who_designation='VOC'
+        ),
+        'Delta': ViralVariant(
+            name='Delta',
+            lineage='B.1.617.2',
+            mutations=['S:L452R', 'S:T478K', 'S:D614G', 'S:P681R', 'S:D950N'],
+            spike_mutations=['L452R', 'T478K', 'D614G', 'P681R'],
+            emergence_date=datetime(2021, 3, 1),
+            who_designation='VOC'
+        ),
+        'Omicron BA.1': ViralVariant(
+            name='Omicron BA.1',
+            lineage='B.1.1.529',
+            mutations=[
+                'S:A67V', 'S:T95I', 'S:G142D', 'S:N211I', 'S:G339D', 'S:S371L', 'S:S373P',
+                'S:S375F', 'S:K417N', 'S:N440K', 'S:G446S', 'S:S477N', 'S:T478K', 'S:E484A',
+                'S:Q493R', 'S:G496S', 'S:Q498R', 'S:N501Y', 'S:Y505H', 'S:T547K', 'S:D614G',
+                'S:H655Y', 'S:N679K', 'S:P681H', 'S:N764K', 'S:D796Y', 'S:N856K', 'S:Q954H',
+                'S:N969K', 'S:L981F'
+            ],
+            spike_mutations=[
+                'A67V', 'del69-70', 'T95I', 'del142-144', 'Y145D', 'del211', 'L212I',
+                'ins214EPE', 'G339D', 'S371L', 'S373P', 'S375F', 'K417N', 'N440K', 'G446S',
+                'S477N', 'T478K', 'E484A', 'Q493R', 'G496S', 'Q498R', 'N501Y', 'Y505H',
+                'T547K', 'D614G', 'H655Y', 'N679K', 'P681H', 'N764K', 'D796Y', 'N856K',
+                'Q954H', 'N969K', 'L981F'
+            ],
+            emergence_date=datetime(2021, 11, 1),
+            who_designation='VOC'
+        ),
+        'Omicron BA.2': ViralVariant(
+            name='Omicron BA.2',
+            lineage='BA.2',
+            mutations=[
+                'S:T19I', 'S:G142D', 'S:V213G', 'S:G339D', 'S:S371F', 'S:S373P', 'S:S375F',
+                'S:T376A', 'S:D405N', 'S:R408S', 'S:K417N', 'S:N440K', 'S:S477N', 'S:T478K',
+                'S:E484A', 'S:Q493R', 'S:Q498R', 'S:N501Y', 'S:Y505H', 'S:D614G', 'S:H655Y',
+                'S:N679K', 'S:P681H', 'S:N764K', 'S:D796Y', 'S:Q954H', 'S:N969K'
+            ],
+            spike_mutations=['T19I', 'del24-26', 'A27S', 'G142D', 'V213G', 'G339D', 'S371F',
+                           'S373P', 'S375F', 'T376A', 'D405N', 'R408S', 'K417N', 'N440K',
+                           'S477N', 'T478K', 'E484A', 'Q493R', 'Q498R', 'N501Y', 'Y505H',
+                           'D614G', 'H655Y', 'N679K', 'P681H', 'N764K', 'D796Y', 'Q954H', 'N969K'],
+            emergence_date=datetime(2022, 1, 1),
+            who_designation='VOC'
+        ),
+        'XBB.1.5': ViralVariant(
+            name='XBB.1.5',
+            lineage='XBB.1.5',
+            mutations=[
+                'S:T19I', 'S:V83A', 'S:G142D', 'S:E180V', 'S:V213E', 'S:G339H', 'S:R346T',
+                'S:L368I', 'S:S371F', 'S:S373P', 'S:S375F', 'S:T376A', 'S:D405N', 'S:R408S',
+                'S:K417N', 'S:N440K', 'S:V445P', 'S:G446S', 'S:N460K', 'S:S477N', 'S:T478K',
+                'S:E484A', 'S:F486P', 'S:F490S', 'S:Q498R', 'S:N501Y', 'S:Y505H', 'S:D614G',
+                'S:H655Y', 'S:N679K', 'S:P681H', 'S:N764K', 'S:D796Y', 'S:Q954H', 'S:N969K'
+            ],
+            spike_mutations=['T19I', 'V83A', 'del144', 'E180V', 'V213E', 'G339H', 'R346T',
+                           'L368I', 'S371F', 'S373P', 'S375F', 'T376A', 'D405N', 'R408S',
+                           'K417N', 'N440K', 'V445P', 'G446S', 'N460K', 'S477N', 'T478K',
+                           'E484A', 'F486P', 'F490S', 'Q498R', 'N501Y', 'Y505H', 'D614G',
+                           'H655Y', 'N679K', 'P681H', 'N764K', 'D796Y', 'Q954H', 'N969K'],
+            emergence_date=datetime(2023, 1, 1),
+            who_designation='VOI'
+        )
+    }
+    
+    @classmethod
+    def get_variant(cls, name: str) -> Optional[ViralVariant]:
+        """Retrieve variant by name"""
+        return cls.SARS_COV2_VARIANTS.get(name)
+    
+    @classmethod
+    def get_all_variants(cls) -> Dict[str, ViralVariant]:
+        """Get all variants"""
+        return cls.SARS_COV2_VARIANTS.copy()
+
+# ==========================================
+# 3. ESCAPE MUTATION PREDICTOR
+# ==========================================
+
+class EscapeMutationPredictor(nn.Module):
+    """
+    Neural network for predicting antibody escape mutations
+    """
+    
+    def __init__(self, embedding_dim: int = 128, hidden_dim: int = 256):
+        super().__init__()
+        
+        # Amino acid embedding
+        self.aa_embedding = nn.Embedding(21, embedding_dim)  # 20 AAs + padding
+        
+        # Mutation effect predictor
+        self.mutation_encoder = nn.Sequential(
+            nn.Linear(embedding_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Antibody context encoder
+        self.antibody_encoder = nn.LSTM(
+            embedding_dim, hidden_dim // 2,
+            num_layers=2, batch_first=True, bidirectional=True
+        )
+        
+        # Escape probability predictor
+        self.escape_predictor = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim // 2, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+        # Fitness cost predictor
+        self.fitness_predictor = nn.Sequential(
+            nn.Linear(hidden_dim // 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, wild_aa: torch.Tensor, mutant_aa: torch.Tensor,
+                antibody_seq: torch.Tensor, position: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Predict escape probability and fitness cost
+        """
+        # Encode amino acids
+        wild_emb = self.aa_embedding(wild_aa)
+        mutant_emb = self.aa_embedding(mutant_aa)
+        
+        # Combine wild-type and mutant
+        mutation_input = torch.cat([wild_emb, mutant_emb], dim=-1)
+        mutation_features = self.mutation_encoder(mutation_input)
+        
+        # Encode antibody sequence
+        antibody_emb = self.aa_embedding(antibody_seq)
+        antibody_out, (hn, cn) = self.antibody_encoder(antibody_emb)
+        antibody_features = hn.transpose(0, 1).contiguous().view(antibody_seq.size(0), -1)
+        
+        # Combine features
+        combined = torch.cat([mutation_features, antibody_features], dim=-1)
+        
+        # Predictions
+        escape_prob = self.escape_predictor(combined)
+        fitness_cost = self.fitness_predictor(mutation_features)
+        
+        return {
+            'escape_probability': escape_prob,
+            'fitness_cost': fitness_cost,
+            'escape_score': escape_prob * (1 - fitness_cost)  # Balance escape and fitness
+        }
+
+# ==========================================
+# 4. VARIANT ANALYZER
+# ==========================================
+
+class VariantAnalyzer:
+    """
+    Comprehensive variant analysis including neutralization prediction
+    """
+    
+    def __init__(self, base_model: nn.Module = None):
+        self.base_model = base_model or EscapeMutationPredictor()
+        self.variant_db = VariantDatabase()
+        self.aa_properties = self._initialize_aa_properties()
+    
+    def _initialize_aa_properties(self) -> Dict[str, Dict[str, float]]:
+        """Initialize amino acid properties for mutation analysis"""
+        return {
+            'A': {'hydrophobic': 1.8, 'size': 88.6, 'charge': 0},
+            'R': {'hydrophobic': -4.5, 'size': 173.4, 'charge': 1},
+            'N': {'hydrophobic': -3.5, 'size': 114.1, 'charge': 0},
+            'D': {'hydrophobic': -3.5, 'size': 111.1, 'charge': -1},
+            'C': {'hydrophobic': 2.5, 'size': 108.5, 'charge': 0},
+            'E': {'hydrophobic': -3.5, 'size': 138.4, 'charge': -1},
+            'Q': {'hydrophobic': -3.5, 'size': 143.8, 'charge': 0},
+            'G': {'hydrophobic': -0.4, 'size': 60.1, 'charge': 0},
+            'H': {'hydrophobic': -3.2, 'size': 153.2, 'charge': 0.5},
+            'I': {'hydrophobic': 4.5, 'size': 166.7, 'charge': 0},
+            'L': {'hydrophobic': 3.8, 'size': 166.7, 'charge': 0},
+            'K': {'hydrophobic': -3.9, 'size': 168.6, 'charge': 1},
+            'M': {'hydrophobic': 1.9, 'size': 162.9, 'charge': 0},
+            'F': {'hydrophobic': 2.8, 'size': 189.9, 'charge': 0},
+            'P': {'hydrophobic': -1.6, 'size': 112.7, 'charge': 0},
+            'S': {'hydrophobic': -0.8, 'size': 89.0, 'charge': 0},
+            'T': {'hydrophobic': -0.7, 'size': 116.1, 'charge': 0},
+            'W': {'hydrophobic': -0.9, 'size': 227.8, 'charge': 0},
+            'Y': {'hydrophobic': -1.3, 'size': 193.6, 'charge': 0},
+            'V': {'hydrophobic': 4.2, 'size': 140.0, 'charge': 0}
+        }
+    
+    def analyze_variant_impact(self, 
+                              antibody_seq: str,
+                              variant_name: str,
+                              reference_seq: str) -> Dict[str, any]:
+        """
+        Analyze the impact of a variant on antibody binding
+        """
+        variant = self.variant_db.get_variant(variant_name)
+        if not variant:
+            raise ValueError(f"Unknown variant: {variant_name}")
+        
+        results = {
+            'variant_name': variant_name,
+            'lineage': variant.lineage,
+            'mutations': variant.mutations,
+            'predicted_escape': 0.0,
+            'mutation_effects': {},
+            'key_escape_mutations': []
+        }
+        
+        # Analyze each mutation
+        for mutation in variant.spike_mutations:
+            if not mutation or len(mutation) < 3:
+                continue
+                
+            # Parse mutation (e.g., "E484K")
+            if mutation.startswith('del') or mutation.startswith('ins'):
+                # Handle deletions/insertions separately
+                continue
+                
+            wild_aa = mutation[0]
+            position = ''.join(filter(str.isdigit, mutation))
+            mutant_aa = mutation[-1]
+            
+            if position:
+                effect = self._calculate_mutation_effect(
+                    wild_aa, mutant_aa, int(position), antibody_seq
+                )
+                results['mutation_effects'][mutation] = effect
+                
+                if effect['escape_score'] > 0.7:
+                    results['key_escape_mutations'].append(mutation)
+        
+        # Calculate overall escape probability
+        if results['mutation_effects']:
+            escape_scores = [m['escape_score'] for m in results['mutation_effects'].values()]
+            results['predicted_escape'] = 1 - np.prod([1 - s for s in escape_scores])
+        
+        return results
+    
+    def _calculate_mutation_effect(self,
+                                 wild_aa: str,
+                                 mutant_aa: str,
+                                 position: int,
+                                 antibody_seq: str) -> Dict[str, float]:
+        """
+        Calculate the effect of a single mutation
+        """
+        # Simple heuristic model (would use trained model in production)
+        effect = {
+            'position': position,
+            'wild_type': wild_aa,
+            'mutant': mutant_aa,
+            'escape_score': 0.0,
+            'fitness_cost': 0.0,
+            'property_change': {}
+        }
+        
+        # Calculate property changes
+        if wild_aa in self.aa_properties and mutant_aa in self.aa_properties:
+            wild_props = self.aa_properties[wild_aa]
+            mutant_props = self.aa_properties[mutant_aa]
+            
+            effect['property_change'] = {
+                'hydrophobic_change': mutant_props['hydrophobic'] - wild_props['hydrophobic'],
+                'size_change': mutant_props['size'] - wild_props['size'],
+                'charge_change': mutant_props['charge'] - wild_props['charge']
+            }
+            
+            # Heuristic escape score based on property changes
+            # Large changes in key positions suggest escape
+            if position in [417, 484, 501]:  # Key RBD positions
+                if abs(effect['property_change']['charge_change']) > 0:
+                    effect['escape_score'] += 0.4
+                if abs(effect['property_change']['size_change']) > 50:
+                    effect['escape_score'] += 0.3
+                if abs(effect['property_change']['hydrophobic_change']) > 3:
+                    effect['escape_score'] += 0.3
+            else:
+                # Lower impact for other positions
+                effect['escape_score'] = min(0.5, 
+                    abs(effect['property_change']['charge_change']) * 0.2 +
+                    abs(effect['property_change']['size_change']) / 200 +
+                    abs(effect['property_change']['hydrophobic_change']) / 10
+                )
+            
+            # Fitness cost (mutations to/from Pro or Gly often costly)
+            if wild_aa in ['P', 'G'] or mutant_aa in ['P', 'G']:
+                effect['fitness_cost'] = 0.3
+            else:
+                effect['fitness_cost'] = 0.1
+        
+        return effect
+    
+    def predict_neutralization_breadth(self,
+                                      antibody_seq: str,
+                                      reference_seq: str) -> pd.DataFrame:
+        """
+        Predict neutralization across all variants
+        """
+        results = []
+        
+        for variant_name, variant in self.variant_db.get_all_variants().items():
+            impact = self.analyze_variant_impact(antibody_seq, variant_name, reference_seq)
+            
+            # Estimate neutralization (1 - escape probability)
+            neutralization = 1 - impact['predicted_escape']
+            
+            results.append({
+                'Variant': variant_name,
+                'Lineage': variant.lineage,
+                'WHO_Designation': variant.who_designation,
+                'Neutralization': neutralization,
+                'Escape_Probability': impact['predicted_escape'],
+                'Key_Mutations': ', '.join(impact['key_escape_mutations'][:3]),
+                'Emergence_Date': variant.emergence_date
+            })
+        
+        df = pd.DataFrame(results)
+        df['Breadth_Category'] = pd.cut(df['Neutralization'], 
+                                       bins=[0, 0.3, 0.7, 1.0],
+                                       labels=['Resistant', 'Reduced', 'Effective'])
+        
+        return df.sort_values('Emergence_Date')
+
+# ==========================================
+# 5. PHYLOGENETIC ANALYSIS
+# ==========================================
+
+class PhylogeneticAnalyzer:
+    """
+    Analyze evolutionary relationships between variants
+    """
+    
+    def __init__(self):
+        self.variant_db = VariantDatabase()
+    
+    def calculate_mutation_distance(self, 
+                                   variant1: ViralVariant,
+                                   variant2: ViralVariant) -> float:
+        """
+        Calculate mutation-based distance between variants
+        """
+        mutations1 = set(variant1.mutations)
+        mutations2 = set(variant2.mutations)
+        
+        # Jaccard distance
+        intersection = len(mutations1.intersection(mutations2))
+        union = len(mutations1.union(mutations2))
+        
+        if union == 0:
+            return 0.0
+        
+        return 1 - (intersection / union)
+    
+    def build_distance_matrix(self) -> pd.DataFrame:
+        """
+        Build pairwise distance matrix for all variants
+        """
+        variants = list(self.variant_db.get_all_variants().values())
+        n = len(variants)
+        distance_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = self.calculate_mutation_distance(variants[i], variants[j])
+                distance_matrix[i, j] = dist
+                distance_matrix[j, i] = dist
+        
+        variant_names = [v.name for v in variants]
+        return pd.DataFrame(distance_matrix, index=variant_names, columns=variant_names)
+    
+    def plot_phylogenetic_tree(self, save_path: str = "phylogenetic_tree.png"):
+        """
+        Create dendrogram showing variant relationships
+        """
+        distance_matrix = self.build_distance_matrix()
+        
+        # Perform hierarchical clustering
+        linkage_matrix = linkage(squareform(distance_matrix.values), method='average')
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        dendrogram(linkage_matrix, 
+                  labels=distance_matrix.index.tolist(),
+                  ax=ax,
+                  orientation='right')
+        
+        ax.set_xlabel('Mutation Distance', fontsize=12)
+        ax.set_title('Variant Phylogenetic Tree (Based on Spike Mutations)', fontsize=14)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 6. TEMPORAL EVOLUTION ANALYZER
+# ==========================================
+
+class TemporalEvolutionAnalyzer:
+    """
+    Analyze how variants evolve over time
+    """
+    
+    def __init__(self):
+        self.variant_db = VariantDatabase()
+    
+    def analyze_mutation_accumulation(self) -> pd.DataFrame:
+        """
+        Track mutation accumulation over time
+        """
+        variants = self.variant_db.get_all_variants().values()
+        
+        data = []
+        for variant in variants:
+            if variant.emergence_date:
+                data.append({
+                    'Variant': variant.name,
+                    'Date': variant.emergence_date,
+                    'Total_Mutations': len(variant.mutations),
+                    'Spike_Mutations': len(variant.spike_mutations),
+                    'Lineage': variant.lineage
+                })
+        
+        df = pd.DataFrame(data)
+        df = df.sort_values('Date')
+        df['Cumulative_Mutations'] = df['Total_Mutations'].cumsum()
+        
+        return df
+    
+    def plot_mutation_timeline(self, save_path: str = "mutation_timeline.png"):
+        """
+        Plot mutation accumulation timeline
+        """
+        df = self.analyze_mutation_accumulation()
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+        
+        # Plot 1: Mutations per variant
+        ax1.bar(df['Variant'], df['Spike_Mutations'], 
+               color='steelblue', alpha=0.7, label='Spike Mutations')
+        ax1.set_xlabel('Variant', fontsize=12)
+        ax1.set_ylabel('Number of Mutations', fontsize=12)
+        ax1.set_title('Spike Mutations by Variant', fontsize=14)
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Timeline
+        ax2.plot(df['Date'], df['Total_Mutations'], 
+                marker='o', markersize=8, linewidth=2, color='darkred')
+        
+        for idx, row in df.iterrows():
+            ax2.annotate(row['Variant'], 
+                        (row['Date'], row['Total_Mutations']),
+                        textcoords="offset points", 
+                        xytext=(0,10), ha='center', fontsize=8)
+        
+        ax2.set_xlabel('Emergence Date', fontsize=12)
+        ax2.set_ylabel('Total Mutations', fontsize=12)
+        ax2.set_title('Mutation Accumulation Over Time', fontsize=14)
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 7. ESCAPE MAP VISUALIZATION
+# ==========================================
+
+class EscapeMapVisualizer:
+    """
+    Create comprehensive escape maps and visualizations
+    """
+    
+    def __init__(self):
+        self.variant_analyzer = VariantAnalyzer()
+        self.key_positions = [417, 444, 445, 446, 452, 453, 477, 478, 484, 485, 486, 
+                             490, 493, 494, 498, 501, 505]  # Key RBD positions
+    
+    def create_escape_heatmap(self,
+                             antibody_profiles: List[AntibodyProfile],
+                             save_path: str = "escape_heatmap.png"):
+        """
+        Create heatmap showing escape mutations across antibodies
+        """
+        # Prepare data matrix
+        variants = list(VariantDatabase.get_all_variants().keys())
+        antibodies = [ab.antibody_id for ab in antibody_profiles]
+        
+        escape_matrix = np.zeros((len(antibodies), len(variants)))
+        
+        for i, ab_profile in enumerate(antibody_profiles):
+            for j, variant in enumerate(variants):
+                if variant in ab_profile.variant_neutralization:
+                    # Convert IC50 to escape probability
+                    ic50 = ab_profile.variant_neutralization[variant]
+                    escape_matrix[i, j] = 1 / (1 + np.exp(-np.log10(ic50)))
+        
+        # Create heatmap
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        sns.heatmap(escape_matrix,
+                   xticklabels=variants,
+                   yticklabels=antibodies,
+                   cmap='RdYlGn_r',
+                   cbar_kws={'label': 'Escape Probability'},
+                   linewidths=0.5,
+                   linecolor='gray',
+                   ax=ax)
+        
+        ax.set_xlabel('Variant', fontsize=12)
+        ax.set_ylabel('Antibody', fontsize=12)
+        ax.set_title('Antibody Escape Map Across Variants', fontsize=14)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
+    def plot_mutation_network(self, save_path: str = "mutation_network.png"):
+        """
+        Create network graph of variant relationships
+        """
+        G = nx.Graph()
+        
+        variants = VariantDatabase.get_all_variants()
+        
+        # Add nodes
+        for name, variant in variants.items():
+            G.add_node(name, 
+                      mutations=len(variant.mutations),
+                      designation=variant.who_designation or 'Other')
+        
+        # Add edges based on shared mutations
+        for v1, v2 in combinations(variants.keys(), 2):
+            var1 = variants[v1]
+            var2 = variants[v2]
+            
+            shared = len(set(var1.mutations).intersection(set(var2.mutations)))
+            if shared > 0:
+                G.add_edge(v1, v2, weight=shared)
+        
+        # Create layout
+        pos = nx.spring_layout(G, k=2, iterations=50)
+        
+        # Draw network
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Color nodes by WHO designation
+        color_map = {'VOC': 'red', 'VOI': 'orange', 'VUM': 'yellow', 
+                    'Reference': 'green', 'Other': 'lightgray'}
+        node_colors = [color_map.get(G.nodes[node].get('designation', 'Other'), 'lightgray') 
+                      for node in G.nodes()]
+        
+        # Size nodes by number of mutations
+        node_sizes = [G.nodes[node]['mutations'] * 50 for node in G.nodes()]
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
+                             node_size=node_sizes, alpha=0.7, ax=ax)
+        
+        # Draw edges with width proportional to shared mutations
+        edges = G.edges()
+        weights = [G[u][v]['weight'] for u, v in edges]
+        nx.draw_networkx_edges(G, pos, width=weights, alpha=0.5, ax=ax)
+        
+        # Draw labels
+        nx.draw_networkx_labels(G, pos, font_size=9, font_weight='bold', ax=ax)
+        
+        ax.set_title('Variant Mutation Network', fontsize=14)
+        ax.axis('off')
+        
+        # Add legend
+        legend_elements = [plt.scatter([], [], c=color, s=100, alpha=0.7, label=designation)
+                          for designation, color in color_map.items() if designation != 'Other']
+        ax.legend(handles=legend_elements, loc='upper left', title='WHO Designation')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 8. INTEGRATED VARIANT ANALYSIS PIPELINE
+# ==========================================
+
+class VariantAnalysisPipeline:
+    """
+    Complete pipeline for variant analysis
+    """
+    
+    def __init__(self):
+        self.variant_analyzer = VariantAnalyzer()
+        self.phylo_analyzer = PhylogeneticAnalyzer()
+        self.temporal_analyzer = TemporalEvolutionAnalyzer()
+        self.escape_visualizer = EscapeMapVisualizer()
+    
+    def comprehensive_variant_analysis(self,
+                                      antibody_seq: str,
+                                      reference_seq: str = None,
+                                      antibody_profiles: List[AntibodyProfile] = None) -> Dict:
+        """
+        Run complete variant analysis pipeline
+        """
+        print("=" * 70)
+        print("COMPREHENSIVE VARIANT ANALYSIS PIPELINE")
+        print("=" * 70)
+        
+        results = {}
+        
+        # 1. Neutralization breadth prediction
+        print("\n1. Analyzing Neutralization Breadth...")
+        breadth_df = self.variant_analyzer.predict_neutralization_breadth(
+            antibody_seq, reference_seq or "REFERENCE"
+        )
+        results['neutralization_breadth'] = breadth_df
+        
+        print(f"   Effective against: {(breadth_df['Breadth_Category'] == 'Effective').sum()} variants")
+        print(f"   Reduced against: {(breadth_df['Breadth_Category'] == 'Reduced').sum()} variants")
+        print(f"   Resistant: {(breadth_df['Breadth_Category'] == 'Resistant').sum()} variants")
+        
+        # 2. Key escape mutations
+        print("\n2. Identifying Key Escape Mutations...")
+        escape_mutations = set()
+        for _, row in breadth_df.iterrows():
+            if row['Key_Mutations']:
+                escape_mutations.update(row['Key_Mutations'].split(', '))
+        
+        results['key_escape_mutations'] = list(escape_mutations)
+        print(f"   Found {len(escape_mutations)} unique escape mutations")
+        
+        # 3. Phylogenetic analysis
+        print("\n3. Building Phylogenetic Tree...")
+        self.phylo_analyzer.plot_phylogenetic_tree()
+        print("   Phylogenetic tree saved")
+        
+        # 4. Temporal evolution
+        print("\n4. Analyzing Temporal Evolution...")
+        temporal_df = self.temporal_analyzer.analyze_mutation_accumulation()
+        results['temporal_evolution'] = temporal_df
+        self.temporal_analyzer.plot_mutation_timeline()
+        print("   Timeline analysis complete")
+        
+        # 5. Mutation network
+        print("\n5. Creating Mutation Network...")
+        self.escape_visualizer.plot_mutation_network()
+        print("   Network visualization saved")
+        
+        # 6. Generate comprehensive report
+        print("\n6. Generating Report...")
+        self._generate_variant_report(results, antibody_seq)
+        
+        print("\n" + "=" * 70)
+        print("ANALYSIS COMPLETE")
+        print("=" * 70)
+        
+        return results
+    
+    def _generate_variant_report(self, results: Dict, antibody_seq: str):
+        """
+        Generate comprehensive variant analysis report
+        """
+        report = f"""
+VARIANT ANALYSIS REPORT
+=======================
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ANTIBODY INFORMATION
+--------------------
+Sequence Length: {len(antibody_seq)} aa
+Sequence (first 50 aa): {antibody_seq[:50]}...
+
+NEUTRALIZATION BREADTH SUMMARY
+------------------------------
+"""
+        
+        breadth_df = results['neutralization_breadth']
+        
+        # Overall statistics
+        total_variants = len(breadth_df)
+        effective = (breadth_df['Breadth_Category'] == 'Effective').sum()
+        reduced = (breadth_df['Breadth_Category'] == 'Reduced').sum()
+        resistant = (breadth_df['Breadth_Category'] == 'Resistant').sum()
+        
+        report += f"""
+Total Variants Analyzed: {total_variants}
+- Reduced Neutralization: {reduced} ({reduced/total_variants*100:.1f}%)
+- Resistant: {resistant} ({resistant/total_variants*100:.1f}%)
+
+Breadth Score: {effective/total_variants:.2f}
+VARIANT-SPECIFIC RESULTS
+------------------------
+"""
+        
+        # Top neutralized variants
+        top_neutralized = breadth_df.nlargest(5, 'Neutralization')
+        report += "\nTop Neutralized Variants:\n"
+        for _, row in top_neutralized.iterrows():
+            report += f"  - {row['Variant']} ({row['Lineage']}): {row['Neutralization']:.3f}\n"
+        
+        # Resistant variants
+        resistant_variants = breadth_df[breadth_df['Breadth_Category'] == 'Resistant']
+                report += f"  - {row['Variant']} ({row['Lineage']}): "
+                report += f"Escape={row['Escape_Probability']:.3f}, "
+                report += f"Key mutations: {row['Key_Mutations']}\n"
+        
+        report += f"""
+KEY ESCAPE MUTATIONS
+-------------------
+Total Unique Escape Mutations: {len(results['key_escape_mutations'])}
+
+Most Common Escape Mutations:
+"""
+        for mutation in results['key_escape_mutations'][:10]:
+            report += f"  - {mutation}\n"
+        
+        # Temporal insights
+        if 'temporal_evolution' in results:
+            temporal_df = results['temporal_evolution']
+            report += f"""
+TEMPORAL EVOLUTION
+-----------------
+Mutation Accumulation Rate: {temporal_df['Total_Mutations'].mean():.1f} mutations/variant
+Latest Variant: {temporal_df.iloc[-1]['Variant']} ({temporal_df.iloc[-1]['Date'].strftime('%Y-%m')})
+"""
+        
+RECOMMENDATIONS
+--------------
+"""
+        
+        # Generate recommendations based on analysis
+        if effective / total_variants > 0.7:
+            report += "✓ Strong breadth - suitable for prophylactic use\n"
+        elif effective / total_variants > 0.4:
+            report += "⚠ Moderate breadth - consider cocktail approach\n"
+        else:
+            report += "✗ Limited breadth - significant optimization needed\n"
+        
+            report += "⚠ Multiple escape pathways identified - monitor for resistance\n"
+        
+        if resistant > 2:
+            report += "✗ Resistance to multiple variants of concern\n"
+        
+        report += """
+--------------
+1. phylogenetic_tree.png - Variant evolutionary relationships
+2. mutation_timeline.png - Temporal mutation accumulation
+3. mutation_network.png - Variant connection network
+4. variant_analysis_report.txt - This report
+
+"""
+        
+        # Save report
+        with open("variant_analysis_report.txt", "w") as f:
+            f.write(report)
+        
+        print(report)
+
+# ==========================================
+# 9. DEMONSTRATION
+# ==========================================
+
+    """
+    Demonstration of variant analysis capabilities
+    """
+    
+    # Example antibody sequence (simplified)
+    antibody_seq = """
+    QVQLVQSGAEVKKPGSSVKVSCKASGGTFSSYAISWVRQAPGQGLEWMGGIIPIFGTANYAQKFQG
+    RVTITADESTSTAYMELSSLRSEDTAVYYCAKDPRGYFYAMDYWGQGTLVTVSS
+    """.replace("\n", "").replace(" ", "")
+    
+    # Initialize pipeline
+    pipeline = VariantAnalysisPipeline()
+    
+    # Run comprehensive analysis
+    results = pipeline.comprehensive_variant_analysis(
+        antibody_seq=antibody_seq,
+        reference_seq="WILDTYPE_SPIKE_SEQUENCE"  # Would be actual sequence
+    )
+    
+    # Additional visualizations
+    print("\n✓ Variant analysis complete!")
+    print("Check generated files for detailed visualizations.")
+    
+    return results
+
+if __name__ == "__main__":
+    results = demo_variant_analysis()

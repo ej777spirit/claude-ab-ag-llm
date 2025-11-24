@@ -1,0 +1,245 @@
+import os
+import torch
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+
+class BiologicalDataset(Dataset):
+    """
+    Ingests biological sequence data and aligns it to the MAMMAL Modular Tokenizer.
+    Input: CSV with columns ['antibody_seq', 'antigen_seq', 'label']
+    """
+    def __init__(self, data_source, tokenizer_op, type_hint, max_length=900):
+        # Allow passing a DataFrame directly or a path to CSV
+        if isinstance(data_source, str):
+            if not os.path.exists(data_source):
+                raise FileNotFoundError(f"Data source {data_source} not found.")
+            self.data = pd.read_csv(data_source)
+        else:
+            self.data = data_source
+        
+        self.tokenizer_op = tokenizer_op
+        self.type_hint = type_hint
+        self.max_length = max_length
+        
+        # Validate required columns
+        required_cols = ['antibody_seq', 'antigen_seq', 'label']
+        if not all(col in self.data.columns for col in required_cols):
+            raise ValueError(f"Dataset must contain columns: {required_cols}")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        """
+        Retrieves and tokenizes a single antibody-antigen pair.
+        Returns: (input_ids, attention_mask, label)
+        """
+        row = self.data.iloc[idx]
+        antibody_seq = row['antibody_seq']
+        antigen_seq = row['antigen_seq']
+        label = row['label']
+        
+        # Combine sequences with separator token
+        # Format: "<cls> antibody_seq <sep> antigen_seq <eos>"
+        combined_seq = f"{antibody_seq} <sep> {antigen_seq}"
+        
+        # Tokenize using MAMMAL tokenizer
+        # The tokenizer_op expects a dictionary with specific keys
+        tokenizer_input = {
+            self.type_hint: combined_seq
+        }
+        
+        # Apply tokenization
+        tokenized = self.tokenizer_op(tokenizer_input)
+        
+        # Extract input_ids and attention_mask
+        # MAMMAL tokenizer returns these in the tokenized dict
+        input_ids = tokenized.get('input_ids', tokenized.get(f'{self.type_hint}_input_ids'))
+        attention_mask = tokenized.get('attention_mask', tokenized.get(f'{self.type_hint}_attention_mask'))
+        
+        # Ensure tensors and proper length
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        if not isinstance(attention_mask, torch.Tensor):
+            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        
+        # Truncate if needed
+        if input_ids.shape[0] > self.max_length:
+            input_ids = input_ids[:self.max_length]
+            attention_mask = attention_mask[:self.max_length]
+        
+        # Convert label to tensor
+        label = torch.tensor(label, dtype=torch.float32)
+        
+        return input_ids, attention_mask, label
+
+
+def collate_batch(batch):
+    """
+    Custom collate function for DataLoader.
+    Pads sequences to the longest in the batch for efficient processing.
+    
+    Args:
+        batch: List of tuples (input_ids, attention_mask, label)
+    
+    Returns:
+        Padded tensors ready for model input
+    """
+    input_ids, masks, labels = zip(*batch)
+    
+    # Pad sequences to the longest in the batch (efficient)
+    # padding_value=0 is typically the pad token ID
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(
+        input_ids, 
+        batch_first=True, 
+        padding_value=0
+    )
+    
+    masks_padded = torch.nn.utils.rnn.pad_sequence(
+        masks, 
+        batch_first=True, 
+        padding_value=0
+    )
+    
+    # Stack labels (no padding needed as they're scalars)
+    labels_stacked = torch.stack(labels)
+    
+    return input_ids_padded, masks_padded, labels_stacked
+
+
+# Example usage function to demonstrate how to create dataloaders
+def create_dataloaders(train_data, val_data, tokenizer_op, type_hint, config):
+    """
+    Creates training and validation dataloaders with the fixed dataset implementation.
+    
+    Args:
+        train_data: Training data (DataFrame or CSV path)
+        val_data: Validation data (DataFrame or CSV path)
+        tokenizer_op: MAMMAL tokenizer operation
+        type_hint: Type hint for tokenizer (e.g., PROTEIN_SEQUENCE_HEADER)
+        config: Configuration dictionary with batch_size, max_length, etc.
+    
+    Returns:
+        train_loader, val_loader
+    """
+    # Create datasets
+    train_dataset = BiologicalDataset(
+        data_source=train_data,
+        tokenizer_op=tokenizer_op,
+        type_hint=type_hint,
+        max_length=config.get("MAX_LENGTH", 900)
+    )
+    
+    val_dataset = BiologicalDataset(
+        data_source=val_data,
+        tokenizer_op=tokenizer_op,
+        type_hint=type_hint,
+        max_length=config.get("MAX_LENGTH", 900)
+    )
+    
+    # Create dataloaders with custom collate function
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.get("BATCH_SIZE", 8),
+        shuffle=True,
+        collate_fn=collate_batch,
+        num_workers=2,
+        pin_memory=True if config.get("DEVICE") == "cuda" else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.get("BATCH_SIZE", 8),
+        shuffle=False,
+        collate_fn=collate_batch,
+        num_workers=2,
+        pin_memory=True if config.get("DEVICE") == "cuda" else False
+    )
+    
+    return train_loader, val_loader
+
+
+# Sample data creation function for testing
+def create_sample_data(num_samples=100):
+    """
+    Creates sample antibody-antigen binding data for testing.
+    
+    Returns:
+        DataFrame with antibody_seq, antigen_seq, and label columns
+    """
+    import random
+    import string
+    
+    # Amino acid alphabet
+    aa_alphabet = 'ACDEFGHIKLMNPQRSTVWY'
+    
+    data = []
+    for _ in range(num_samples):
+        # Generate random sequences (simplified - real sequences have structure)
+        antibody_length = random.randint(100, 150)
+        antigen_length = random.randint(50, 200)
+        
+        antibody_seq = ''.join(random.choices(aa_alphabet, k=antibody_length))
+        antigen_seq = ''.join(random.choices(aa_alphabet, k=antigen_length))
+        
+        # Random binary label (0 or 1 for binding)
+        label = random.randint(0, 1)
+        
+        data.append({
+            'antibody_seq': antibody_seq,
+            'antigen_seq': antigen_seq,
+            'label': label
+        })
+    
+    return pd.DataFrame(data)
+
+
+# Integration test to verify the fix works
+if __name__ == "__main__":
+    print("Testing fixed BiologicalDataset implementation...")
+    
+    # Create sample data
+    sample_df = create_sample_data(20)
+    print(f"Created sample data with {len(sample_df)} entries")
+    print(f"Columns: {sample_df.columns.tolist()}")
+    
+    # Mock tokenizer for testing (in real use, this would be the MAMMAL tokenizer)
+    class MockTokenizer:
+        def __call__(self, input_dict):
+            # Simulate tokenization
+            text = list(input_dict.values())[0]
+            # Simple mock: convert to list of integers
+            tokens = [ord(c) % 100 for c in text[:100]]  # Limit to 100 for testing
+            return {
+                'input_ids': torch.tensor(tokens, dtype=torch.long),
+                'attention_mask': torch.ones(len(tokens), dtype=torch.long)
+            }
+    
+    mock_tokenizer = MockTokenizer()
+    
+    # Create dataset
+    dataset = BiologicalDataset(
+        data_source=sample_df,
+        tokenizer_op=mock_tokenizer,
+        type_hint='sequence',
+        max_length=150
+    )
+    
+    print(f"\nDataset created with {len(dataset)} samples")
+    
+    # Test single item retrieval
+    input_ids, mask, label = dataset[0]
+    print(f"Single item shapes - Input IDs: {input_ids.shape}, Mask: {mask.shape}, Label: {label.shape}")
+    
+    # Test with dataloader
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        collate_fn=collate_batch,
+        shuffle=True
+    )
+    
+    # Get one batch
+    batch_input_ids, batch_masks, batch_labels = next(iter(loader))
+    print(f"\nBatch shapes - Input IDs: {batch_input_ids.shape}, Masks: {batch_masks.shape}, Labels: {batch_labels.shape}")
+    print("\nFixed implementation test completed successfully!")

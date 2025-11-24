@@ -1,0 +1,36 @@
+from variant_analysis_module import VariantAnalysisPipeline
+
+# Initialize pipeline
+pipeline = VariantAnalysisPipeline()
+
+# Analyze your antibody candidate
+results = pipeline.comprehensive_variant_analysis(
+    antibody_seq=your_antibody_sequence,
+    reference_seq=wild_type_spike_sequence
+)
+
+# Get neutralization breadth
+breadth_df = results['neutralization_breadth']
+print(f"Breadth score: {(breadth_df['Breadth_Category'] == 'Effective').mean():.2f}")
+
+# Identify escape mutations to monitor
+escape_mutations = results['key_escape_mutations']
+print(f"Key escape mutations: {escape_mutations}")
+from variant_analysis_module import VariantAnalysisPipeline
+
+# Initialize pipeline
+pipeline = VariantAnalysisPipeline()
+
+# Analyze your antibody candidate
+results = pipeline.comprehensive_variant_analysis(
+    antibody_seq=your_antibody_sequence,
+    reference_seq=wild_type_spike_sequence
+)
+
+# Get neutralization breadth
+breadth_df = results['neutralization_breadth']
+print(f"Breadth score: {(breadth_df['Breadth_Category'] == 'Effective').mean():.2f}")
+
+# Identify escape mutations to monitor
+escape_mutations = results['key_escape_mutations']
+print(f"Key escape mutations: {escape_mutations}")

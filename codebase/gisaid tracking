@@ -1,0 +1,2160 @@
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL v4: GISAID Real-Time Variant Tracker
+Integration with GISAID for real-time variant monitoring and emerging threat detection
+
+Features:
+- GISAID metadata parsing
+- Real-time variant prevalence tracking
+- Geographic distribution analysis
+- Emerging variant detection
+- Mutation frequency analysis
+- Variant surge alerts
+- Antibody resistance prediction for new variants
+
+Author: EJ
+Date: November 2024
+
+Note: Requires GISAID access credentials (register at gisaid.org)
+"""
+
+import os
+import json
+import gzip
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass, field
+from collections import defaultdict, Counter
+import warnings
+import re
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+warnings.filterwarnings('ignore')
+
+# For API interactions
+try:
+    import aiohttp
+    import asyncio
+    ASYNC_AVAILABLE = True
+except ImportError:
+    ASYNC_AVAILABLE = False
+    print("Async libraries not available. Some features will be limited.")
+
+# ==========================================
+# 1. GISAID DATA STRUCTURES
+# ==========================================
+
+@dataclass
+class GISAIDVariant:
+    """Enhanced variant structure with GISAID metadata"""
+    accession_id: str
+    virus_name: str
+    collection_date: datetime
+    location: str
+    country: str
+    region: str
+    lineage: str
+    clade: str
+    aa_substitutions: List[str]
+    nucleotide_mutations: List[str]
+    submission_date: datetime
+    host: str = "Human"
+    age: Optional[int] = None
+    sex: Optional[str] = None
+    patient_status: Optional[str] = None
+    sampling_strategy: Optional[str] = None
+    coverage: Optional[float] = None
+    qc_status: Optional[str] = None
+    
+    def get_spike_mutations(self) -> List[str]:
+        """Extract spike protein mutations"""
+        return [mut for mut in self.aa_substitutions if mut.startswith('S:')]
+    
+    def get_rbd_mutations(self) -> List[str]:
+        """Extract RBD-specific mutations (positions 319-541)"""
+        rbd_muts = []
+        for mut in self.get_spike_mutations():
+            match = re.match(r'S:([A-Z])(\d+)([A-Z])', mut)
+            if match:
+                pos = int(match.group(2))
+                if 319 <= pos <= 541:
+                    rbd_muts.append(mut)
+        return rbd_muts
+
+@dataclass
+class VariantPrevalence:
+    """Track variant prevalence over time"""
+    variant_name: str
+    lineage: str
+    date: datetime
+    count: int
+    total_sequences: int
+    prevalence: float
+    countries: List[str]
+    growth_rate: Optional[float] = None
+    doubling_time: Optional[float] = None
+
+@dataclass
+class EmergingThreat:
+    """Identify emerging variants of concern"""
+    lineage: str
+    first_detected: datetime
+    current_prevalence: float
+    growth_rate: float
+    geographic_spread: int  # Number of countries
+    key_mutations: List[str]
+    antibody_escape_score: float
+    threat_level: str  # "Low", "Medium", "High", "Critical"
+    rationale: str
+
+# ==========================================
+# 2. GISAID API INTERFACE
+# ==========================================
+
+class GISAIDInterface:
+    """
+    Interface for GISAID data access
+    Note: Requires GISAID credentials
+    """
+    
+    def __init__(self, username: str = None, password: str = None):
+        self.username = username or os.getenv('GISAID_USERNAME')
+        self.password = password or os.getenv('GISAID_PASSWORD')
+        self.base_url = "https://www.epicov.org/epi3/api"
+        self.session = None
+        self.token = None
+        
+        # Cache for data
+        self.variant_cache = {}
+        self.last_update = None
+    
+    async def authenticate(self):
+        """Authenticate with GISAID API"""
+        if not ASYNC_AVAILABLE:
+            print("Async not available, using mock authentication")
+            self.token = "MOCK_TOKEN"
+            return
+        
+        # Note: Actual GISAID API authentication would go here
+        # This is a placeholder structure
+        async with aiohttp.ClientSession() as session:
+            auth_data = {
+                'username': self.username,
+                'password': self.password
+            }
+            # In production, would make actual API call
+            self.token = "AUTH_TOKEN_PLACEHOLDER"
+    
+    def load_metadata_file(self, filepath: str) -> pd.DataFrame:
+        """
+        Load GISAID metadata file (TSV or CSV format)
+        These files can be downloaded from GISAID after login
+        """
+        if filepath.endswith('.gz'):
+            with gzip.open(filepath, 'rt') as f:
+                df = pd.read_csv(f, sep='\t', low_memory=False)
+        else:
+            df = pd.read_csv(filepath, sep='\t' if filepath.endswith('.tsv') else ',', 
+                           low_memory=False)
+        
+        # Standardize column names
+        df.columns = [col.strip().replace(' ', '_').lower() for col in df.columns]
+        
+        # Parse dates
+        if 'collection_date' in df.columns:
+            df['collection_date'] = pd.to_datetime(df['collection_date'], errors='coerce')
+        if 'submission_date' in df.columns:
+            df['submission_date'] = pd.to_datetime(df['submission_date'], errors='coerce')
+        
+        return df
+    
+    def parse_mutations(self, mutation_string: str) -> List[str]:
+        """Parse mutation string from GISAID format"""
+        if pd.isna(mutation_string):
+            return []
+        
+        mutations = []
+        # Handle different mutation formats
+        for mut in mutation_string.split(','):
+            mut = mut.strip()
+            if mut and not mut.startswith('(') and not mut.endswith(')'):
+                mutations.append(mut)
+        
+        return mutations
+
+# ==========================================
+# 3. REAL-TIME VARIANT MONITOR
+# ==========================================
+
+class RealTimeVariantMonitor:
+    """
+    Monitor variants in real-time from GISAID data
+    """
+    
+    def __init__(self, gisaid_interface: GISAIDInterface = None):
+        self.gisaid = gisaid_interface or GISAIDInterface()
+        self.current_variants = {}
+        self.prevalence_history = defaultdict(list)
+        self.emerging_threats = []
+        self.last_analysis = None
+    
+    def analyze_current_landscape(self, 
+                                 metadata_df: pd.DataFrame,
+                                 window_days: int = 30) -> Dict:
+        """
+        Analyze current variant landscape from GISAID data
+        """
+        # Filter to recent sequences
+        cutoff_date = datetime.now() - timedelta(days=window_days)
+        recent_df = metadata_df[metadata_df['collection_date'] >= cutoff_date].copy()
+        
+        print(f"Analyzing {len(recent_df)} sequences from last {window_days} days")
+        
+        results = {
+            'total_sequences': len(recent_df),
+            'date_range': (recent_df['collection_date'].min(), 
+                          recent_df['collection_date'].max()),
+            'countries': recent_df['country'].nunique(),
+            'lineage_counts': {},
+            'mutation_frequencies': {},
+            'geographic_distribution': {},
+            'growth_rates': {}
+        }
+        
+        # Lineage distribution
+        if 'pango_lineage' in recent_df.columns:
+            lineage_counts = recent_df['pango_lineage'].value_counts()
+            results['lineage_counts'] = lineage_counts.to_dict()
+            
+            # Calculate prevalence
+            for lineage, count in lineage_counts.items():
+                prevalence = count / len(recent_df)
+                self.current_variants[lineage] = {
+                    'count': count,
+                    'prevalence': prevalence,
+                    'countries': recent_df[recent_df['pango_lineage'] == lineage]['country'].nunique()
+                }
+        
+        # Mutation frequency analysis
+        if 'aa_substitutions' in recent_df.columns:
+            all_mutations = []
+            for muts in recent_df['aa_substitutions'].dropna():
+                all_mutations.extend(self.gisaid.parse_mutations(muts))
+            
+            mutation_counts = Counter(all_mutations)
+            total = len(recent_df)
+            results['mutation_frequencies'] = {
+                mut: count/total for mut, count in mutation_counts.most_common(50)
+            }
+        
+        # Geographic distribution
+        for country in recent_df['country'].unique():
+            country_df = recent_df[recent_df['country'] == country]
+            if 'pango_lineage' in country_df.columns:
+                results['geographic_distribution'][country] = {
+                    'total': len(country_df),
+                    'lineages': country_df['pango_lineage'].value_counts().to_dict()
+                }
+        
+        # Calculate growth rates
+        results['growth_rates'] = self._calculate_growth_rates(metadata_df)
+        
+        self.last_analysis = datetime.now()
+        return results
+    
+    def _calculate_growth_rates(self, 
+                               metadata_df: pd.DataFrame,
+                               min_sequences: int = 10) -> Dict[str, float]:
+        """
+        Calculate growth rates for each lineage
+        """
+        growth_rates = {}
+        
+        if 'pango_lineage' not in metadata_df.columns:
+            return growth_rates
+        
+        # Group by week and lineage
+        metadata_df['week'] = pd.to_datetime(metadata_df['collection_date']).dt.to_period('W')
+        weekly_counts = metadata_df.groupby(['week', 'pango_lineage']).size().reset_index(name='count')
+        
+        for lineage in weekly_counts['pango_lineage'].unique():
+            lineage_data = weekly_counts[weekly_counts['pango_lineage'] == lineage].sort_values('week')
+            
+            if len(lineage_data) >= 4 and lineage_data['count'].sum() >= min_sequences:
+                # Calculate log growth rate
+                weeks = np.arange(len(lineage_data))
+                log_counts = np.log(lineage_data['count'].values + 1)
+                
+                # Linear regression on log counts
+                slope, intercept, r_value, p_value, std_err = stats.linregress(weeks, log_counts)
+                
+                if p_value < 0.05:  # Significant growth
+                    growth_rates[lineage] = {
+                        'rate': slope,
+                        'r_squared': r_value ** 2,
+                        'p_value': p_value,
+                        'doubling_time': np.log(2) / slope if slope > 0 else None
+                    }
+        
+        return growth_rates
+    
+    def detect_emerging_threats(self, 
+                              metadata_df: pd.DataFrame,
+                              threshold_growth: float = 0.5,
+                              threshold_spread: int = 5) -> List[EmergingThreat]:
+        """
+        Detect emerging variants that may pose a threat
+        """
+        threats = []
+        current_analysis = self.analyze_current_landscape(metadata_df)
+        
+        for lineage, growth_data in current_analysis['growth_rates'].items():
+            if growth_data['rate'] > threshold_growth:
+                # Get lineage details
+                lineage_df = metadata_df[metadata_df['pango_lineage'] == lineage]
+                
+                if len(lineage_df) < 10:
+                    continue
+                
+                # Extract key mutations
+                key_mutations = []
+                if 'aa_substitutions' in lineage_df.columns:
+                    all_muts = []
+                    for muts in lineage_df['aa_substitutions'].dropna():
+                        all_muts.extend(self.gisaid.parse_mutations(muts))
+                    
+                    mut_counts = Counter(all_muts)
+                    # Get mutations present in >80% of sequences
+                    key_mutations = [mut for mut, count in mut_counts.items() 
+                                   if count > 0.8 * len(lineage_df)]
+                
+                # Calculate escape score (simplified)
+                escape_score = self._calculate_escape_potential(key_mutations)
+                
+                # Determine threat level
+                geographic_spread = lineage_df['country'].nunique()
+                
+                if growth_data['rate'] > 1.0 and geographic_spread > 10:
+                    threat_level = "Critical"
+                elif growth_data['rate'] > 0.7 and geographic_spread > 5:
+                    threat_level = "High"
+                elif growth_data['rate'] > 0.5:
+                    threat_level = "Medium"
+                else:
+                    threat_level = "Low"
+                
+                threat = EmergingThreat(
+                    lineage=lineage,
+                    first_detected=lineage_df['collection_date'].min(),
+                    current_prevalence=self.current_variants.get(lineage, {}).get('prevalence', 0),
+                    growth_rate=growth_data['rate'],
+                    geographic_spread=geographic_spread,
+                    key_mutations=key_mutations[:10],  # Top 10
+                    antibody_escape_score=escape_score,
+                    threat_level=threat_level,
+                    rationale=f"Growth rate: {growth_data['rate']:.2f}, "
+                             f"Spread: {geographic_spread} countries, "
+                             f"Escape score: {escape_score:.2f}"
+                )
+                
+                threats.append(threat)
+        
+        # Sort by threat level and growth rate
+        threats.sort(key=lambda x: (x.threat_level == "Critical", 
+                                   x.threat_level == "High",
+                                   x.growth_rate), reverse=True)
+        
+        self.emerging_threats = threats
+        return threats
+    
+    def _calculate_escape_potential(self, mutations: List[str]) -> float:
+        """
+        Calculate antibody escape potential based on mutations
+        """
+        # Key escape mutations (simplified scoring)
+        escape_mutations = {
+            'S:K417N': 0.8, 'S:K417T': 0.8,
+            'S:L452R': 0.7, 'S:L452Q': 0.7,
+            'S:E484K': 0.9, 'S:E484Q': 0.8, 'S:E484A': 0.7,
+            'S:N501Y': 0.6,
+            'S:P681H': 0.5, 'S:P681R': 0.5,
+            'S:D614G': 0.3,
+            'S:Q493R': 0.7,
+            'S:G446S': 0.6,
+            'S:F486V': 0.8, 'S:F486P': 0.7,
+            'S:R346T': 0.6,
+            'S:N440K': 0.5,
+            'S:S477N': 0.5
+        }
+        
+        total_escape = 0
+        for mut in mutations:
+            if mut in escape_mutations:
+                total_escape += escape_mutations[mut]
+            elif mut.startswith('S:'):
+                # Unknown spike mutation - assign small score
+                total_escape += 0.2
+        
+        # Normalize to 0-1 range
+        return min(1.0, total_escape / 5.0)
+
+# ==========================================
+# 4. PREVALENCE TRACKER
+# ==========================================
+
+class PrevalenceTracker:
+    """
+    Track and visualize variant prevalence over time
+    """
+    
+    def __init__(self):
+        self.prevalence_data = defaultdict(list)
+        self.regional_data = defaultdict(lambda: defaultdict(list))
+    
+    def update_prevalence(self, metadata_df: pd.DataFrame, 
+                         time_window: str = 'W') -> pd.DataFrame:
+        """
+        Calculate prevalence over time windows
+        """
+        # Create time windows
+        metadata_df['time_window'] = metadata_df['collection_date'].dt.to_period(time_window)
+        
+        # Calculate prevalence by lineage and time
+        prevalence_results = []
+        
+        for window in metadata_df['time_window'].unique():
+            if pd.isna(window):
+                continue
+                
+            window_df = metadata_df[metadata_df['time_window'] == window]
+            total = len(window_df)
+            
+            if total == 0:
+                continue
+            
+            # Calculate lineage prevalence
+            if 'pango_lineage' in window_df.columns:
+                lineage_counts = window_df['pango_lineage'].value_counts()
+                
+                for lineage, count in lineage_counts.items():
+                    prevalence_results.append({
+                        'date': window.to_timestamp(),
+                        'lineage': lineage,
+                        'count': count,
+                        'total': total,
+                        'prevalence': count / total * 100,
+                        'countries': window_df[window_df['pango_lineage'] == lineage]['country'].nunique()
+                    })
+        
+        prevalence_df = pd.DataFrame(prevalence_results)
+        return prevalence_df
+    
+    def plot_prevalence_timeline(self, 
+                                prevalence_df: pd.DataFrame,
+                                top_n: int = 10,
+                                save_path: str = "prevalence_timeline.html"):
+        """
+        Create interactive prevalence timeline using Plotly
+        """
+        # Get top lineages by max prevalence
+        top_lineages = (prevalence_df.groupby('lineage')['prevalence']
+                       .max()
+                       .nlargest(top_n)
+                       .index.tolist())
+        
+        # Filter to top lineages
+        plot_df = prevalence_df[prevalence_df['lineage'].isin(top_lineages)].copy()
+        
+        # Create interactive plot
+        fig = px.area(plot_df, 
+                     x='date', 
+                     y='prevalence',
+                     color='lineage',
+                     title='Variant Prevalence Over Time',
+                     labels={'prevalence': 'Prevalence (%)',
+                            'date': 'Date',
+                            'lineage': 'Lineage'},
+                     hover_data=['count', 'total', 'countries'])
+        
+        fig.update_layout(
+            hovermode='x unified',
+            xaxis_title="Collection Date",
+            yaxis_title="Prevalence (%)",
+            height=600
+        )
+        
+        fig.write_html(save_path)
+        print(f"Interactive prevalence timeline saved to {save_path}")
+        
+        return fig
+    
+    def plot_geographic_distribution(self,
+                                    metadata_df: pd.DataFrame,
+                                    save_path: str = "geographic_distribution.html"):
+        """
+        Create world map of variant distribution
+        """
+        # Get current month data
+        current_month = datetime.now().replace(day=1)
+        recent_df = metadata_df[
+            pd.to_datetime(metadata_df['collection_date']) >= current_month
+        ]
+        
+        # Aggregate by country
+        country_data = []
+        for country in recent_df['country'].unique():
+            country_df = recent_df[recent_df['country'] == country]
+            
+            if 'pango_lineage' in country_df.columns:
+                dominant_lineage = country_df['pango_lineage'].mode()
+                if len(dominant_lineage) > 0:
+                    dominant_lineage = dominant_lineage[0]
+                else:
+                    dominant_lineage = "Unknown"
+                
+                country_data.append({
+                    'country': country,
+                    'sequences': len(country_df),
+                    'dominant_lineage': dominant_lineage,
+                    'lineage_diversity': country_df['pango_lineage'].nunique()
+                })
+        
+        geo_df = pd.DataFrame(country_data)
+        
+        # Create choropleth map
+        fig = px.choropleth(geo_df,
+                           locations='country',
+                           locationmode='country names',
+                           color='sequences',
+                           hover_data=['dominant_lineage', 'lineage_diversity'],
+                           title='Global Variant Distribution',
+                           color_continuous_scale='YlOrRd')
+        
+        fig.update_layout(
+            geo=dict(showframe=False,
+                    showcoastlines=True,
+                    projection_type='natural earth'),
+            height=600
+        )
+        
+        fig.write_html(save_path)
+        print(f"Geographic distribution map saved to {save_path}")
+        
+        return fig
+
+# ==========================================
+# 5. ANTIBODY RESISTANCE PREDICTOR
+# ==========================================
+
+class AntibodyResistancePredictor:
+    """
+    Predict antibody resistance for emerging variants
+    """
+    
+    def __init__(self):
+        self.known_escape_mutations = self._load_escape_database()
+        self.epitope_map = self._load_epitope_map()
+    
+    def _load_escape_database(self) -> Dict[str, Dict]:
+        """
+        Load database of known escape mutations
+        """
+        # This would be loaded from a comprehensive database
+        # Here's a simplified version
+        return {
+            'S:K417N': {'escape_fold': 5.0, 'antibody_classes': ['Class 1']},
+            'S:K417T': {'escape_fold': 4.5, 'antibody_classes': ['Class 1']},
+            'S:L452R': {'escape_fold': 3.0, 'antibody_classes': ['Class 2']},
+            'S:E484K': {'escape_fold': 10.0, 'antibody_classes': ['Class 2', 'Class 3']},
+            'S:E484A': {'escape_fold': 6.0, 'antibody_classes': ['Class 2', 'Class 3']},
+            'S:N501Y': {'escape_fold': 2.0, 'antibody_classes': ['Class 1']},
+            'S:Q493R': {'escape_fold': 4.0, 'antibody_classes': ['Class 1']},
+            'S:G446S': {'escape_fold': 3.5, 'antibody_classes': ['Class 3']},
+            'S:F486V': {'escape_fold': 8.0, 'antibody_classes': ['Class 1', 'Class 2']},
+        }
+    
+    def _load_epitope_map(self) -> Dict[str, str]:
+        """
+        Map positions to epitope regions
+        """
+        epitope_map = {}
+        
+        # RBS (Receptor Binding Site)
+        for pos in range(437, 508):
+            epitope_map[pos] = 'RBS'
+        
+        # NTD (N-Terminal Domain)
+        for pos in range(14, 306):
+            epitope_map[pos] = 'NTD'
+        
+        # S2
+        for pos in range(686, 1273):
+            epitope_map[pos] = 'S2'
+        
+        return epitope_map
+    
+    def predict_antibody_resistance(self,
+                                   variant_mutations: List[str],
+                                   antibody_class: str = None) -> Dict:
+        """
+        Predict resistance level for a variant
+        """
+        total_escape = 1.0
+        affected_epitopes = set()
+        key_mutations = []
+        
+        for mutation in variant_mutations:
+            if mutation in self.known_escape_mutations:
+                escape_data = self.known_escape_mutations[mutation]
+                
+                # Check if affects this antibody class
+                if antibody_class and antibody_class not in escape_data['antibody_classes']:
+                    continue
+                
+                # Multiplicative model for escape
+                total_escape *= escape_data['escape_fold']
+                key_mutations.append(mutation)
+                
+                # Track affected epitopes
+                match = re.match(r'S:[A-Z](\d+)[A-Z]', mutation)
+                if match:
+                    pos = int(match.group(1))
+                    if pos in self.epitope_map:
+                        affected_epitopes.add(self.epitope_map[pos])
+        
+        # Calculate resistance category
+        if total_escape > 10:
+            resistance_level = "High"
+        elif total_escape > 3:
+            resistance_level = "Moderate"
+        else:
+            resistance_level = "Low"
+        
+        return {
+            'total_escape_fold': total_escape,
+            'resistance_level': resistance_level,
+            'key_escape_mutations': key_mutations,
+            'affected_epitopes': list(affected_epitopes),
+            'predicted_ic50_fold_change': total_escape
+        }
+
+# ==========================================
+# 6. ALERT SYSTEM
+# ==========================================
+
+class VariantAlertSystem:
+    """
+    Alert system for significant variant changes
+    """
+    
+    def __init__(self, alert_threshold: Dict = None):
+        self.alert_threshold = alert_threshold or {
+            'growth_rate': 0.5,
+            'prevalence_change': 10.0,  # percentage points
+            'geographic_spread': 5,  # countries
+            'escape_score': 0.7
+        }
+        self.alerts = []
+    
+    def check_alerts(self,
+                    current_analysis: Dict,
+                    previous_analysis: Dict = None) -> List[Dict]:
+        """
+        Check for conditions that warrant alerts
+        """
+        alerts = []
+        
+        # Check growth rates
+        for lineage, growth_data in current_analysis.get('growth_rates', {}).items():
+            if growth_data['rate'] > self.alert_threshold['growth_rate']:
+                alerts.append({
+                    'type': 'RAPID_GROWTH',
+                    'severity': 'HIGH' if growth_data['rate'] > 1.0 else 'MEDIUM',
+                    'lineage': lineage,
+                    'message': f"Lineage {lineage} showing rapid growth: "
+                              f"{growth_data['rate']:.2f} per week",
+                    'data': growth_data
+                })
+        
+        # Check prevalence changes
+        if previous_analysis:
+            for lineage, current_prev in current_analysis.get('lineage_counts', {}).items():
+                if lineage in previous_analysis.get('lineage_counts', {}):
+                    prev_prev = previous_analysis['lineage_counts'][lineage]
+                    change = (current_prev - prev_prev) / current_analysis['total_sequences'] * 100
+                    
+                    if abs(change) > self.alert_threshold['prevalence_change']:
+                        alerts.append({
+                            'type': 'PREVALENCE_SHIFT',
+                            'severity': 'HIGH' if change > 20 else 'MEDIUM',
+                            'lineage': lineage,
+                            'message': f"Lineage {lineage} prevalence changed by "
+                                     f"{change:.1f} percentage points",
+                            'data': {'previous': prev_prev, 'current': current_prev}
+                        })
+        
+        # Check geographic spread
+        for lineage, data in current_analysis.get('lineage_counts', {}).items():
+            if lineage in current_analysis.get('geographic_distribution', {}):
+                countries = len([c for c, d in current_analysis['geographic_distribution'].items()
+                               if lineage in d.get('lineages', {})])
+                
+                if countries > self.alert_threshold['geographic_spread']:
+                    alerts.append({
+                        'type': 'GEOGRAPHIC_SPREAD',
+                        'severity': 'MEDIUM',
+                        'lineage': lineage,
+                        'message': f"Lineage {lineage} detected in {countries} countries",
+                        'data': {'countries': countries}
+                    })
+        
+        self.alerts = alerts
+        return alerts
+    
+    def generate_alert_report(self, save_path: str = "variant_alerts.txt"):
+        """
+        Generate comprehensive alert report
+        """
+        report = f"""
+VARIANT SURVEILLANCE ALERT REPORT
+==================================
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ACTIVE ALERTS: {len(self.alerts)}
+"""
+        
+        if not self.alerts:
+            report += "\nNo active alerts at this time.\n"
+        else:
+            # Group by severity
+            high_alerts = [a for a in self.alerts if a['severity'] == 'HIGH']
+            medium_alerts = [a for a in self.alerts if a['severity'] == 'MEDIUM']
+            low_alerts = [a for a in self.alerts if a.get('severity') == 'LOW']
+            
+            if high_alerts:
+                report += f"\nHIGH SEVERITY ALERTS ({len(high_alerts)}):\n"
+                report += "-" * 40 + "\n"
+                for alert in high_alerts:
+                    report += f"• {alert['message']}\n"
+                    report += f"  Type: {alert['type']}\n"
+                    report += f"  Lineage: {alert['lineage']}\n\n"
+            
+            if medium_alerts:
+                report += f"\nMEDIUM SEVERITY ALERTS ({len(medium_alerts)}):\n"
+                report += "-" * 40 + "\n"
+                for alert in medium_alerts:
+                    report += f"• {alert['message']}\n"
+                    report += f"  Type: {alert['type']}\n\n"
+        
+        report += """
+RECOMMENDED ACTIONS:
+-------------------
+1. Review antibody panels for coverage of alerted lineages
+2. Initiate resistance testing for high-growth variants
+3. Update neutralization assays to include emerging threats
+4. Consider prophylactic antibody cocktail modifications
+
+"""
+        
+        with open(save_path, 'w') as f:
+            f.write(report)
+        
+        print(report)
+        return report
+
+# ==========================================
+# 7. INTEGRATED GISAID PIPELINE
+# ==========================================
+
+class GISAIDAnalysisPipeline:
+    """
+    Complete pipeline for GISAID variant analysis
+    """
+    
+    def __init__(self, gisaid_credentials: Dict = None):
+        self.gisaid = GISAIDInterface(
+            username=gisaid_credentials.get('username') if gisaid_credentials else None,
+            password=gisaid_credentials.get('password') if gisaid_credentials else None
+        )
+        self.monitor = RealTimeVariantMonitor(self.gisaid)
+        self.prevalence_tracker = PrevalenceTracker()
+        self.resistance_predictor = AntibodyResistancePredictor()
+        self.alert_system = VariantAlertSystem()
+    
+    def run_surveillance(self,
+                        metadata_file: str,
+                        antibody_sequences: List[str] = None,
+                        output_dir: str = "gisaid_analysis") -> Dict:
+        """
+        Run complete surveillance analysis
+        """
+        print("=" * 70)
+        print("GISAID REAL-TIME SURVEILLANCE PIPELINE")
+        print("=" * 70)
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load metadata
+        print("\n1. Loading GISAID metadata...")
+        metadata_df = self.gisaid.load_metadata_file(metadata_file)
+        print(f"   Loaded {len(metadata_df)} sequences")
+        print(f"   Date range: {metadata_df['collection_date'].min()} to {metadata_df['collection_date'].max()}")
+        
+        # Current landscape analysis
+        print("\n2. Analyzing current variant landscape...")
+        current_analysis = self.monitor.analyze_current_landscape(metadata_df)
+        print(f"   Found {len(current_analysis['lineage_counts'])} active lineages")
+        print(f"   Geographic spread: {current_analysis['countries']} countries")
+        
+        # Detect emerging threats
+        print("\n3. Detecting emerging threats...")
+        threats = self.monitor.detect_emerging_threats(metadata_df)
+        print(f"   Identified {len(threats)} emerging threats")
+        
+        if threats:
+            print("\n   Top Threats:")
+            for threat in threats[:5]:
+                print(f"   - {threat.lineage}: {threat.threat_level} "
+                     f"(growth: {threat.growth_rate:.2f}, spread: {threat.geographic_spread} countries)")
+        
+        # Calculate prevalence
+        print("\n4. Tracking prevalence over time...")
+        prevalence_df = self.prevalence_tracker.update_prevalence(metadata_df)
+        self.prevalence_tracker.plot_prevalence_timeline(
+            prevalence_df, 
+            save_path=os.path.join(output_dir, "prevalence_timeline.html")
+        )
+        
+        # Geographic distribution
+        print("\n5. Mapping geographic distribution...")
+        self.prevalence_tracker.plot_geographic_distribution(
+            metadata_df,
+            save_path=os.path.join(output_dir, "geographic_distribution.html")
+        )
+        
+        # Antibody resistance predictions
+        resistance_predictions = {}
+        if antibody_sequences:
+            print("\n6. Predicting antibody resistance...")
+            for i, ab_seq in enumerate(antibody_sequences):
+                print(f"   Analyzing antibody {i+1}/{len(antibody_sequences)}")
+                
+                ab_resistance = {}
+                for threat in threats[:10]:  # Top 10 threats
+                    resistance = self.resistance_predictor.predict_antibody_resistance(
+                        threat.key_mutations
+                    )
+                    ab_resistance[threat.lineage] = resistance
+                
+                resistance_predictions[f"Antibody_{i+1}"] = ab_resistance
+        
+        # Check alerts
+        print("\n7. Checking surveillance alerts...")
+        alerts = self.alert_system.check_alerts(current_analysis)
+        print(f"   Generated {len(alerts)} alerts")
+        
+        # Generate reports
+        print("\n8. Generating reports...")
+        self._generate_surveillance_report(
+            current_analysis, threats, alerts, resistance_predictions,
+            os.path.join(output_dir, "surveillance_report.txt")
+        )
+        
+        self.alert_system.generate_alert_report(
+            os.path.join(output_dir, "variant_alerts.txt")
+        )
+        
+        print("\n" + "=" * 70)
+        print("SURVEILLANCE COMPLETE")
+        print("=" * 70)
+        
+        return {
+            'current_analysis': current_analysis,
+            'emerging_threats': threats,
+            'prevalence_data': prevalence_df,
+            'resistance_predictions': resistance_predictions,
+            'alerts': alerts
+        }
+    
+    def _generate_surveillance_report(self,
+                                     current_analysis: Dict,
+                                     threats: List[EmergingThreat],
+                                     alerts: List[Dict],
+                                     resistance_predictions: Dict,
+                                     save_path: str):
+        """
+        Generate comprehensive surveillance report
+        """
+        report = f"""
+GISAID SURVEILLANCE REPORT
+==========================
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+CURRENT LANDSCAPE
+-----------------
+Total Sequences Analyzed: {current_analysis['total_sequences']}
+Countries Represented: {current_analysis['countries']}
+Active Lineages: {len(current_analysis['lineage_counts'])}
+
+TOP 5 CIRCULATING LINEAGES:
+"""
+        
+        # Top lineages
+        sorted_lineages = sorted(current_analysis['lineage_counts'].items(), 
+                                key=lambda x: x[1], reverse=True)[:5]
+        for lineage, count in sorted_lineages:
+            prevalence = count / current_analysis['total_sequences'] * 100
+            report += f"  - {lineage}: {count} sequences ({prevalence:.1f}%)\n"
+        
+        # Emerging threats
+        report += f"""
+EMERGING THREATS
+----------------
+Total Identified: {len(threats)}
+
+"""
+        for i, threat in enumerate(threats[:5], 1):
+            report += f"{i}. {threat.lineage} - {threat.threat_level} Risk\n"
+            report += f"   Growth Rate: {threat.growth_rate:.2f}/week\n"
+            report += f"   Geographic Spread: {threat.geographic_spread} countries\n"
+            report += f"   Escape Score: {threat.antibody_escape_score:.2f}\n"
+            report += f"   Key Mutations: {', '.join(threat.key_mutations[:5])}\n\n"
+        
+        # Alerts
+        report += f"""
+ACTIVE ALERTS
+-------------
+Total Alerts: {len(alerts)}
+High Severity: {sum(1 for a in alerts if a['severity'] == 'HIGH')}
+Medium Severity: {sum(1 for a in alerts if a['severity'] == 'MEDIUM')}
+
+"""
+        
+        # Resistance predictions
+        if resistance_predictions:
+            report += """
+ANTIBODY RESISTANCE PREDICTIONS
+-------------------------------
+"""
+            for ab_name, predictions in resistance_predictions.items():
+                report += f"\n{ab_name}:\n"
+                
+                high_risk = [l for l, p in predictions.items() 
+                           if p['resistance_level'] == 'High']
+                if high_risk:
+                    report += f"  High Risk Variants: {', '.join(high_risk)}\n"
+                
+                moderate_risk = [l for l, p in predictions.items() 
+                               if p['resistance_level'] == 'Moderate']
+                if moderate_risk:
+                    report += f"  Moderate Risk: {', '.join(moderate_risk)}\n"
+        
+        report += """
+RECOMMENDATIONS
+--------------
+1. Monitor high-growth lineages for increased transmission
+2. Update antibody panels to include emerging threats
+3. Conduct neutralization assays against new variants
+4. Review vaccine composition for variant coverage
+5. Implement enhanced genomic surveillance in affected regions
+
+GENERATED FILES
+--------------
+- prevalence_timeline.html: Interactive prevalence timeline
+- geographic_distribution.html: Global distribution map
+- variant_alerts.txt: Alert notifications
+- surveillance_report.txt: This report
+
+"""
+        
+        with open(save_path, 'w') as f:
+            f.write(report)
+        
+        return report
+
+# ==========================================
+# 8. DEMO WITH SAMPLE DATA
+# ==========================================
+
+def create_sample_gisaid_data(num_samples: int = 1000) -> pd.DataFrame:
+    """
+    Create sample GISAID-like data for demonstration
+    """
+    np.random.seed(42)
+    
+    # Lineages with different growth patterns
+    lineages = ['BA.5', 'BA.2.75', 'XBB.1.5', 'XBB.1.16', 'EG.5', 'BA.2.86', 'JN.1']
+    countries = ['USA', 'UK', 'Germany', 'France', 'Japan', 'Brazil', 'India', 
+                 'South Africa', 'Australia', 'Canada']
+    
+    data = []
+    base_date = datetime(2023, 1, 1)
+    
+    for i in range(num_samples):
+        # Create temporal patterns
+        days_offset = np.random.randint(0, 365)
+        collection_date = base_date + timedelta(days=days_offset)
+        
+        # Lineage distribution changes over time
+        if days_offset < 90:
+            lineage_weights = [0.4, 0.3, 0.2, 0.05, 0.03, 0.01, 0.01]
+        elif days_offset < 180:
+            lineage_weights = [0.2, 0.2, 0.3, 0.15, 0.1, 0.03, 0.02]
+        elif days_offset < 270:
+            lineage_weights = [0.1, 0.1, 0.2, 0.2, 0.25, 0.1, 0.05]
+        else:
+            lineage_weights = [0.05, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25]
+        
+        lineage = np.random.choice(lineages, p=lineage_weights/np.sum(lineage_weights))
+        
+        # Generate mutations based on lineage
+        spike_mutations = []
+        if lineage in ['XBB.1.5', 'XBB.1.16']:
+            spike_mutations.extend(['S:F486P', 'S:F490S'])
+        if lineage in ['BA.2.86', 'JN.1']:
+            spike_mutations.extend(['S:L455S', 'S:F456L'])
+        if lineage == 'JN.1':
+            spike_mutations.append('S:L455W')
+        
+        # Add random mutations
+        if np.random.random() < 0.3:
+            spike_mutations.append(f'S:{np.random.choice(["K", "N", "E", "D"]) }'
+                                 f'{np.random.randint(400, 510)}'
+                                 f'{np.random.choice(["A", "T", "V", "R"]) }')
+        
+        data.append({
+            'virus_name': f'hCoV-19/{np.random.choice(countries)}/{i}/2023',
+            'accession_id': f'EPI_ISL_{1000000 + i}',
+            'collection_date': collection_date,
+            'submission_date': collection_date + timedelta(days=np.random.randint(1, 30)),
+            'country': np.random.choice(countries),
+            'pango_lineage': lineage,
+            'aa_substitutions': ','.join(spike_mutations),
+            'host': 'Human',
+            'age': np.random.randint(1, 90) if np.random.random() < 0.8 else np.nan,
+            'sex': np.random.choice(['Male', 'Female']) if np.random.random() < 0.7 else np.nan
+        })
+    
+    return pd.DataFrame(data)
+
+def demo_gisaid_analysis():
+    """
+    Demonstrate GISAID analysis with sample data
+    """
+    print("Creating sample GISAID data for demonstration...")
+    
+    # Create sample data
+    sample_df = create_sample_gisaid_data(2000)
+    
+    # Save to temporary file
+    temp_file = "sample_gisaid_metadata.csv"
+    sample_df.to_csv(temp_file, index=False)
+    
+    # Initialize pipeline (no real credentials for demo)
+    pipeline = GISAIDAnalysisPipeline()
+    
+    # Run surveillance
+    results = pipeline.run_surveillance(
+        metadata_file=temp_file,
+        antibody_sequences=["SAMPLE_ANTIBODY_SEQUENCE"],
+        output_dir="gisaid_demo_output"
+    )
+    
+    print("\n✓ GISAID analysis demonstration complete!")
+    print("Check 'gisaid_demo_output' directory for results.")
+    
+    # Clean up
+    os.remove(temp_file)
+    
+    return results
+
+if __name__ == "__main__":
+    results = demo_gisaid_analysis()
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL v4: GISAID Real-Time Variant Tracker
+Integration with GISAID for real-time variant monitoring and emerging threat detection
+
+Features:
+- GISAID metadata parsing
+- Real-time variant prevalence tracking
+- Geographic distribution analysis
+- Emerging variant detection
+- Mutation frequency analysis
+- Variant surge alerts
+- Antibody resistance prediction for new variants
+
+Author: EJ
+Date: November 2024
+
+Note: Requires GISAID access credentials (register at gisaid.org)
+"""
+
+import os
+import json
+import gzip
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass, field
+from collections import defaultdict, Counter
+import warnings
+import re
+from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+warnings.filterwarnings('ignore')
+
+# For API interactions
+try:
+    import aiohttp
+    import asyncio
+    ASYNC_AVAILABLE = True
+except ImportError:
+    ASYNC_AVAILABLE = False
+    print("Async libraries not available. Some features will be limited.")
+
+# ==========================================
+# 1. GISAID DATA STRUCTURES
+# ==========================================
+
+@dataclass
+class GISAIDVariant:
+    """Enhanced variant structure with GISAID metadata"""
+    accession_id: str
+    virus_name: str
+    collection_date: datetime
+    location: str
+    country: str
+    region: str
+    lineage: str
+    clade: str
+    aa_substitutions: List[str]
+    nucleotide_mutations: List[str]
+    submission_date: datetime
+    host: str = "Human"
+    age: Optional[int] = None
+    sex: Optional[str] = None
+    patient_status: Optional[str] = None
+    sampling_strategy: Optional[str] = None
+    coverage: Optional[float] = None
+    qc_status: Optional[str] = None
+    
+    def get_spike_mutations(self) -> List[str]:
+        """Extract spike protein mutations"""
+        return [mut for mut in self.aa_substitutions if mut.startswith('S:')]
+    
+    def get_rbd_mutations(self) -> List[str]:
+        """Extract RBD-specific mutations (positions 319-541)"""
+        rbd_muts = []
+        for mut in self.get_spike_mutations():
+            match = re.match(r'S:([A-Z])(\d+)([A-Z])', mut)
+            if match:
+                pos = int(match.group(2))
+                if 319 <= pos <= 541:
+                    rbd_muts.append(mut)
+        return rbd_muts
+
+@dataclass
+class VariantPrevalence:
+    """Track variant prevalence over time"""
+    variant_name: str
+    lineage: str
+    date: datetime
+    count: int
+    total_sequences: int
+    prevalence: float
+    countries: List[str]
+    growth_rate: Optional[float] = None
+    doubling_time: Optional[float] = None
+
+@dataclass
+class EmergingThreat:
+    """Identify emerging variants of concern"""
+    lineage: str
+    first_detected: datetime
+    current_prevalence: float
+    growth_rate: float
+    geographic_spread: int  # Number of countries
+    key_mutations: List[str]
+    antibody_escape_score: float
+    threat_level: str  # "Low", "Medium", "High", "Critical"
+    rationale: str
+
+# ==========================================
+# 2. GISAID API INTERFACE
+# ==========================================
+
+class GISAIDInterface:
+    """
+    Interface for GISAID data access
+    Note: Requires GISAID credentials
+    """
+    
+    def __init__(self, username: str = None, password: str = None):
+        self.username = username or os.getenv('GISAID_USERNAME')
+        self.password = password or os.getenv('GISAID_PASSWORD')
+        self.base_url = "https://www.epicov.org/epi3/api"
+        self.session = None
+        self.token = None
+        
+        # Cache for data
+        self.variant_cache = {}
+        self.last_update = None
+    
+    async def authenticate(self):
+        """Authenticate with GISAID API"""
+        if not ASYNC_AVAILABLE:
+            print("Async not available, using mock authentication")
+            self.token = "MOCK_TOKEN"
+            return
+        
+        # Note: Actual GISAID API authentication would go here
+        # This is a placeholder structure
+        async with aiohttp.ClientSession() as session:
+            auth_data = {
+                'username': self.username,
+                'password': self.password
+            }
+            # In production, would make actual API call
+            self.token = "AUTH_TOKEN_PLACEHOLDER"
+    
+    def load_metadata_file(self, filepath: str) -> pd.DataFrame:
+        """
+        Load GISAID metadata file (TSV or CSV format)
+        These files can be downloaded from GISAID after login
+        """
+        if filepath.endswith('.gz'):
+            with gzip.open(filepath, 'rt') as f:
+                df = pd.read_csv(f, sep='\t', low_memory=False)
+        else:
+            df = pd.read_csv(filepath, sep='\t' if filepath.endswith('.tsv') else ',', 
+                           low_memory=False)
+        
+        # Standardize column names
+        df.columns = [col.strip().replace(' ', '_').lower() for col in df.columns]
+        
+        # Parse dates
+        if 'collection_date' in df.columns:
+            df['collection_date'] = pd.to_datetime(df['collection_date'], errors='coerce')
+        if 'submission_date' in df.columns:
+            df['submission_date'] = pd.to_datetime(df['submission_date'], errors='coerce')
+        
+        return df
+    
+    def parse_mutations(self, mutation_string: str) -> List[str]:
+        """Parse mutation string from GISAID format"""
+        if pd.isna(mutation_string):
+            return []
+        
+        mutations = []
+        # Handle different mutation formats
+        for mut in mutation_string.split(','):
+            mut = mut.strip()
+            if mut and not mut.startswith('(') and not mut.endswith(')'):
+                mutations.append(mut)
+        
+        return mutations
+
+# ==========================================
+# 3. REAL-TIME VARIANT MONITOR
+# ==========================================
+
+class RealTimeVariantMonitor:
+    """
+    Monitor variants in real-time from GISAID data
+    """
+    
+    def __init__(self, gisaid_interface: GISAIDInterface = None):
+        self.gisaid = gisaid_interface or GISAIDInterface()
+        self.current_variants = {}
+        self.prevalence_history = defaultdict(list)
+        self.emerging_threats = []
+        self.last_analysis = None
+    
+    def analyze_current_landscape(self, 
+                                 metadata_df: pd.DataFrame,
+                                 window_days: int = 30) -> Dict:
+        """
+        Analyze current variant landscape from GISAID data
+        """
+        # Filter to recent sequences
+        cutoff_date = datetime.now() - timedelta(days=window_days)
+        recent_df = metadata_df[metadata_df['collection_date'] >= cutoff_date].copy()
+        
+        print(f"Analyzing {len(recent_df)} sequences from last {window_days} days")
+        
+        results = {
+            'total_sequences': len(recent_df),
+            'date_range': (recent_df['collection_date'].min(), 
+                          recent_df['collection_date'].max()),
+            'countries': recent_df['country'].nunique(),
+            'lineage_counts': {},
+            'mutation_frequencies': {},
+            'geographic_distribution': {},
+            'growth_rates': {}
+        }
+        
+        # Lineage distribution
+        if 'pango_lineage' in recent_df.columns:
+            lineage_counts = recent_df['pango_lineage'].value_counts()
+            results['lineage_counts'] = lineage_counts.to_dict()
+            
+            # Calculate prevalence
+            for lineage, count in lineage_counts.items():
+                prevalence = count / len(recent_df)
+                self.current_variants[lineage] = {
+                    'count': count,
+                    'prevalence': prevalence,
+                    'countries': recent_df[recent_df['pango_lineage'] == lineage]['country'].nunique()
+                }
+        
+        # Mutation frequency analysis
+        if 'aa_substitutions' in recent_df.columns:
+            all_mutations = []
+            for muts in recent_df['aa_substitutions'].dropna():
+                all_mutations.extend(self.gisaid.parse_mutations(muts))
+            
+            mutation_counts = Counter(all_mutations)
+            total = len(recent_df)
+            results['mutation_frequencies'] = {
+                mut: count/total for mut, count in mutation_counts.most_common(50)
+            }
+        
+        # Geographic distribution
+        for country in recent_df['country'].unique():
+            country_df = recent_df[recent_df['country'] == country]
+            if 'pango_lineage' in country_df.columns:
+                results['geographic_distribution'][country] = {
+                    'total': len(country_df),
+                    'lineages': country_df['pango_lineage'].value_counts().to_dict()
+                }
+        
+        # Calculate growth rates
+        results['growth_rates'] = self._calculate_growth_rates(metadata_df)
+        
+        self.last_analysis = datetime.now()
+        return results
+    
+    def _calculate_growth_rates(self, 
+                               metadata_df: pd.DataFrame,
+                               min_sequences: int = 10) -> Dict[str, float]:
+        """
+        Calculate growth rates for each lineage
+        """
+        growth_rates = {}
+        
+        if 'pango_lineage' not in metadata_df.columns:
+            return growth_rates
+        
+        # Group by week and lineage
+        metadata_df['week'] = pd.to_datetime(metadata_df['collection_date']).dt.to_period('W')
+        weekly_counts = metadata_df.groupby(['week', 'pango_lineage']).size().reset_index(name='count')
+        
+        for lineage in weekly_counts['pango_lineage'].unique():
+            lineage_data = weekly_counts[weekly_counts['pango_lineage'] == lineage].sort_values('week')
+            
+            if len(lineage_data) >= 4 and lineage_data['count'].sum() >= min_sequences:
+                # Calculate log growth rate
+                weeks = np.arange(len(lineage_data))
+                log_counts = np.log(lineage_data['count'].values + 1)
+                
+                # Linear regression on log counts
+                slope, intercept, r_value, p_value, std_err = stats.linregress(weeks, log_counts)
+                
+                if p_value < 0.05:  # Significant growth
+                    growth_rates[lineage] = {
+                        'rate': slope,
+                        'r_squared': r_value ** 2,
+                        'p_value': p_value,
+                        'doubling_time': np.log(2) / slope if slope > 0 else None
+                    }
+        
+        return growth_rates
+    
+    def detect_emerging_threats(self, 
+                              metadata_df: pd.DataFrame,
+                              threshold_growth: float = 0.5,
+                              threshold_spread: int = 5) -> List[EmergingThreat]:
+        """
+        Detect emerging variants that may pose a threat
+        """
+        threats = []
+        current_analysis = self.analyze_current_landscape(metadata_df)
+        
+        for lineage, growth_data in current_analysis['growth_rates'].items():
+            if growth_data['rate'] > threshold_growth:
+                # Get lineage details
+                lineage_df = metadata_df[metadata_df['pango_lineage'] == lineage]
+                
+                if len(lineage_df) < 10:
+                    continue
+                
+                # Extract key mutations
+                key_mutations = []
+                if 'aa_substitutions' in lineage_df.columns:
+                    all_muts = []
+                    for muts in lineage_df['aa_substitutions'].dropna():
+                        all_muts.extend(self.gisaid.parse_mutations(muts))
+                    
+                    mut_counts = Counter(all_muts)
+                    # Get mutations present in >80% of sequences
+                    key_mutations = [mut for mut, count in mut_counts.items() 
+                                   if count > 0.8 * len(lineage_df)]
+                
+                # Calculate escape score (simplified)
+                escape_score = self._calculate_escape_potential(key_mutations)
+                
+                # Determine threat level
+                geographic_spread = lineage_df['country'].nunique()
+                
+                if growth_data['rate'] > 1.0 and geographic_spread > 10:
+                    threat_level = "Critical"
+                elif growth_data['rate'] > 0.7 and geographic_spread > 5:
+                    threat_level = "High"
+                elif growth_data['rate'] > 0.5:
+                    threat_level = "Medium"
+                else:
+                    threat_level = "Low"
+                
+                threat = EmergingThreat(
+                    lineage=lineage,
+                    first_detected=lineage_df['collection_date'].min(),
+                    current_prevalence=self.current_variants.get(lineage, {}).get('prevalence', 0),
+                    growth_rate=growth_data['rate'],
+                    geographic_spread=geographic_spread,
+                    key_mutations=key_mutations[:10],  # Top 10
+                    antibody_escape_score=escape_score,
+                    threat_level=threat_level,
+                    rationale=f"Growth rate: {growth_data['rate']:.2f}, "
+                             f"Spread: {geographic_spread} countries, "
+                             f"Escape score: {escape_score:.2f}"
+                )
+                
+                threats.append(threat)
+        
+        # Sort by threat level and growth rate
+        threats.sort(key=lambda x: (x.threat_level == "Critical", 
+                                   x.threat_level == "High",
+                                   x.growth_rate), reverse=True)
+        
+        self.emerging_threats = threats
+        return threats
+    
+    def _calculate_escape_potential(self, mutations: List[str]) -> float:
+        """
+        Calculate antibody escape potential based on mutations
+        """
+        # Key escape mutations (simplified scoring)
+        escape_mutations = {
+            'S:K417N': 0.8, 'S:K417T': 0.8,
+            'S:L452R': 0.7, 'S:L452Q': 0.7,
+            'S:E484K': 0.9, 'S:E484Q': 0.8, 'S:E484A': 0.7,
+            'S:N501Y': 0.6,
+            'S:P681H': 0.5, 'S:P681R': 0.5,
+            'S:D614G': 0.3,
+            'S:Q493R': 0.7,
+            'S:G446S': 0.6,
+            'S:F486V': 0.8, 'S:F486P': 0.7,
+            'S:R346T': 0.6,
+            'S:N440K': 0.5,
+            'S:S477N': 0.5
+        }
+        
+        total_escape = 0
+        for mut in mutations:
+            if mut in escape_mutations:
+                total_escape += escape_mutations[mut]
+            elif mut.startswith('S:'):
+                # Unknown spike mutation - assign small score
+                total_escape += 0.2
+        
+        # Normalize to 0-1 range
+        return min(1.0, total_escape / 5.0)
+
+# ==========================================
+# 4. PREVALENCE TRACKER
+# ==========================================
+
+class PrevalenceTracker:
+    """
+    Track and visualize variant prevalence over time
+    """
+    
+    def __init__(self):
+        self.prevalence_data = defaultdict(list)
+        self.regional_data = defaultdict(lambda: defaultdict(list))
+    
+    def update_prevalence(self, metadata_df: pd.DataFrame, 
+                         time_window: str = 'W') -> pd.DataFrame:
+        """
+        Calculate prevalence over time windows
+        """
+        # Create time windows
+        metadata_df['time_window'] = metadata_df['collection_date'].dt.to_period(time_window)
+        
+        # Calculate prevalence by lineage and time
+        prevalence_results = []
+        
+        for window in metadata_df['time_window'].unique():
+            if pd.isna(window):
+                continue
+                
+            window_df = metadata_df[metadata_df['time_window'] == window]
+            total = len(window_df)
+            
+            if total == 0:
+                continue
+            
+            # Calculate lineage prevalence
+            if 'pango_lineage' in window_df.columns:
+                lineage_counts = window_df['pango_lineage'].value_counts()
+                
+                for lineage, count in lineage_counts.items():
+                    prevalence_results.append({
+                        'date': window.to_timestamp(),
+                        'lineage': lineage,
+                        'count': count,
+                        'total': total,
+                        'prevalence': count / total * 100,
+                        'countries': window_df[window_df['pango_lineage'] == lineage]['country'].nunique()
+                    })
+        
+        prevalence_df = pd.DataFrame(prevalence_results)
+        return prevalence_df
+    
+    def plot_prevalence_timeline(self, 
+                                prevalence_df: pd.DataFrame,
+                                top_n: int = 10,
+                                save_path: str = "prevalence_timeline.html"):
+        """
+        Create interactive prevalence timeline using Plotly
+        """
+        # Get top lineages by max prevalence
+        top_lineages = (prevalence_df.groupby('lineage')['prevalence']
+                       .max()
+                       .nlargest(top_n)
+                       .index.tolist())
+        
+        # Filter to top lineages
+        plot_df = prevalence_df[prevalence_df['lineage'].isin(top_lineages)].copy()
+        
+        # Create interactive plot
+        fig = px.area(plot_df, 
+                     x='date', 
+                     y='prevalence',
+                     color='lineage',
+                     title='Variant Prevalence Over Time',
+                     labels={'prevalence': 'Prevalence (%)',
+                            'date': 'Date',
+                            'lineage': 'Lineage'},
+                     hover_data=['count', 'total', 'countries'])
+        
+        fig.update_layout(
+            hovermode='x unified',
+            xaxis_title="Collection Date",
+            yaxis_title="Prevalence (%)",
+            height=600
+        )
+        
+        fig.write_html(save_path)
+        print(f"Interactive prevalence timeline saved to {save_path}")
+        
+        return fig
+    
+    def plot_geographic_distribution(self,
+                                    metadata_df: pd.DataFrame,
+                                    save_path: str = "geographic_distribution.html"):
+        """
+        Create world map of variant distribution
+        """
+        # Get current month data
+        current_month = datetime.now().replace(day=1)
+        recent_df = metadata_df[
+            pd.to_datetime(metadata_df['collection_date']) >= current_month
+        ]
+        
+        # Aggregate by country
+        country_data = []
+        for country in recent_df['country'].unique():
+            country_df = recent_df[recent_df['country'] == country]
+            
+            if 'pango_lineage' in country_df.columns:
+                dominant_lineage = country_df['pango_lineage'].mode()
+                if len(dominant_lineage) > 0:
+                    dominant_lineage = dominant_lineage[0]
+                else:
+                    dominant_lineage = "Unknown"
+                
+                country_data.append({
+                    'country': country,
+                    'sequences': len(country_df),
+                    'dominant_lineage': dominant_lineage,
+                    'lineage_diversity': country_df['pango_lineage'].nunique()
+                })
+        
+        geo_df = pd.DataFrame(country_data)
+        
+        # Create choropleth map
+        fig = px.choropleth(geo_df,
+                           locations='country',
+                           locationmode='country names',
+                           color='sequences',
+                           hover_data=['dominant_lineage', 'lineage_diversity'],
+                           title='Global Variant Distribution',
+                           color_continuous_scale='YlOrRd')
+        
+        fig.update_layout(
+            geo=dict(showframe=False,
+                    showcoastlines=True,
+                    projection_type='natural earth'),
+            height=600
+        )
+        
+        fig.write_html(save_path)
+        print(f"Geographic distribution map saved to {save_path}")
+        
+        return fig
+
+# ==========================================
+# 5. ANTIBODY RESISTANCE PREDICTOR
+# ==========================================
+
+class AntibodyResistancePredictor:
+    """
+    Predict antibody resistance for emerging variants
+    """
+    
+    def __init__(self):
+        self.known_escape_mutations = self._load_escape_database()
+        self.epitope_map = self._load_epitope_map()
+    
+    def _load_escape_database(self) -> Dict[str, Dict]:
+        """
+        Load database of known escape mutations
+        """
+        # This would be loaded from a comprehensive database
+        # Here's a simplified version
+        return {
+            'S:K417N': {'escape_fold': 5.0, 'antibody_classes': ['Class 1']},
+            'S:K417T': {'escape_fold': 4.5, 'antibody_classes': ['Class 1']},
+            'S:L452R': {'escape_fold': 3.0, 'antibody_classes': ['Class 2']},
+            'S:E484K': {'escape_fold': 10.0, 'antibody_classes': ['Class 2', 'Class 3']},
+            'S:E484A': {'escape_fold': 6.0, 'antibody_classes': ['Class 2', 'Class 3']},
+            'S:N501Y': {'escape_fold': 2.0, 'antibody_classes': ['Class 1']},
+            'S:Q493R': {'escape_fold': 4.0, 'antibody_classes': ['Class 1']},
+            'S:G446S': {'escape_fold': 3.5, 'antibody_classes': ['Class 3']},
+            'S:F486V': {'escape_fold': 8.0, 'antibody_classes': ['Class 1', 'Class 2']},
+        }
+    
+    def _load_epitope_map(self) -> Dict[str, str]:
+        """
+        Map positions to epitope regions
+        """
+        epitope_map = {}
+        
+        # RBS (Receptor Binding Site)
+        for pos in range(437, 508):
+            epitope_map[pos] = 'RBS'
+        
+        # NTD (N-Terminal Domain)
+        for pos in range(14, 306):
+            epitope_map[pos] = 'NTD'
+        
+        # S2
+        for pos in range(686, 1273):
+            epitope_map[pos] = 'S2'
+        
+        return epitope_map
+    
+    def predict_antibody_resistance(self,
+                                   variant_mutations: List[str],
+                                   antibody_class: str = None) -> Dict:
+        """
+        Predict resistance level for a variant
+        """
+        total_escape = 1.0
+        affected_epitopes = set()
+        key_mutations = []
+        
+        for mutation in variant_mutations:
+            if mutation in self.known_escape_mutations:
+                escape_data = self.known_escape_mutations[mutation]
+                
+                # Check if affects this antibody class
+                if antibody_class and antibody_class not in escape_data['antibody_classes']:
+                    continue
+                
+                # Multiplicative model for escape
+                total_escape *= escape_data['escape_fold']
+                key_mutations.append(mutation)
+                
+                # Track affected epitopes
+                match = re.match(r'S:[A-Z](\d+)[A-Z]', mutation)
+                if match:
+                    pos = int(match.group(1))
+                    if pos in self.epitope_map:
+                        affected_epitopes.add(self.epitope_map[pos])
+        
+        # Calculate resistance category
+        if total_escape > 10:
+            resistance_level = "High"
+        elif total_escape > 3:
+            resistance_level = "Moderate"
+        else:
+            resistance_level = "Low"
+        
+        return {
+            'total_escape_fold': total_escape,
+            'resistance_level': resistance_level,
+            'key_escape_mutations': key_mutations,
+            'affected_epitopes': list(affected_epitopes),
+            'predicted_ic50_fold_change': total_escape
+        }
+
+# ==========================================
+# 6. ALERT SYSTEM
+# ==========================================
+
+class VariantAlertSystem:
+    """
+    Alert system for significant variant changes
+    """
+    
+    def __init__(self, alert_threshold: Dict = None):
+        self.alert_threshold = alert_threshold or {
+            'growth_rate': 0.5,
+            'prevalence_change': 10.0,  # percentage points
+            'geographic_spread': 5,  # countries
+            'escape_score': 0.7
+        }
+        self.alerts = []
+    
+    def check_alerts(self,
+                    current_analysis: Dict,
+                    previous_analysis: Dict = None) -> List[Dict]:
+        """
+        Check for conditions that warrant alerts
+        """
+        alerts = []
+        
+        # Check growth rates
+        for lineage, growth_data in current_analysis.get('growth_rates', {}).items():
+            if growth_data['rate'] > self.alert_threshold['growth_rate']:
+                alerts.append({
+                    'type': 'RAPID_GROWTH',
+                    'severity': 'HIGH' if growth_data['rate'] > 1.0 else 'MEDIUM',
+                    'lineage': lineage,
+                    'message': f"Lineage {lineage} showing rapid growth: "
+                              f"{growth_data['rate']:.2f} per week",
+                    'data': growth_data
+                })
+        
+        # Check prevalence changes
+        if previous_analysis:
+            for lineage, current_prev in current_analysis.get('lineage_counts', {}).items():
+                if lineage in previous_analysis.get('lineage_counts', {}):
+                    prev_prev = previous_analysis['lineage_counts'][lineage]
+                    change = (current_prev - prev_prev) / current_analysis['total_sequences'] * 100
+                    
+                    if abs(change) > self.alert_threshold['prevalence_change']:
+                        alerts.append({
+                            'type': 'PREVALENCE_SHIFT',
+                            'severity': 'HIGH' if change > 20 else 'MEDIUM',
+                            'lineage': lineage,
+                            'message': f"Lineage {lineage} prevalence changed by "
+                                     f"{change:.1f} percentage points",
+                            'data': {'previous': prev_prev, 'current': current_prev}
+                        })
+        
+        # Check geographic spread
+        for lineage, data in current_analysis.get('lineage_counts', {}).items():
+            if lineage in current_analysis.get('geographic_distribution', {}):
+                countries = len([c for c, d in current_analysis['geographic_distribution'].items()
+                               if lineage in d.get('lineages', {})])
+                
+                if countries > self.alert_threshold['geographic_spread']:
+                    alerts.append({
+                        'type': 'GEOGRAPHIC_SPREAD',
+                        'severity': 'MEDIUM',
+                        'lineage': lineage,
+                        'message': f"Lineage {lineage} detected in {countries} countries",
+                        'data': {'countries': countries}
+                    })
+        
+        self.alerts = alerts
+        return alerts
+    
+    def generate_alert_report(self, save_path: str = "variant_alerts.txt"):
+        """
+        Generate comprehensive alert report
+        """
+        report = f"""
+VARIANT SURVEILLANCE ALERT REPORT
+==================================
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ACTIVE ALERTS: {len(self.alerts)}
+"""
+        
+        if not self.alerts:
+            report += "\nNo active alerts at this time.\n"
+        else:
+            # Group by severity
+            high_alerts = [a for a in self.alerts if a['severity'] == 'HIGH']
+            medium_alerts = [a for a in self.alerts if a['severity'] == 'MEDIUM']
+            low_alerts = [a for a in self.alerts if a.get('severity') == 'LOW']
+            
+            if high_alerts:
+                report += f"\nHIGH SEVERITY ALERTS ({len(high_alerts)}):\n"
+                report += "-" * 40 + "\n"
+                for alert in high_alerts:
+                    report += f"• {alert['message']}\n"
+                    report += f"  Type: {alert['type']}\n"
+                    report += f"  Lineage: {alert['lineage']}\n\n"
+            
+            if medium_alerts:
+                report += f"\nMEDIUM SEVERITY ALERTS ({len(medium_alerts)}):\n"
+                report += "-" * 40 + "\n"
+                for alert in medium_alerts:
+                    report += f"• {alert['message']}\n"
+                    report += f"  Type: {alert['type']}\n\n"
+        
+        report += """
+RECOMMENDED ACTIONS:
+-------------------
+1. Review antibody panels for coverage of alerted lineages
+2. Initiate resistance testing for high-growth variants
+3. Update neutralization assays to include emerging threats
+4. Consider prophylactic antibody cocktail modifications
+
+"""
+        
+        with open(save_path, 'w') as f:
+            f.write(report)
+        
+        print(report)
+        return report
+
+# ==========================================
+# 7. INTEGRATED GISAID PIPELINE
+# ==========================================
+
+class GISAIDAnalysisPipeline:
+    """
+    Complete pipeline for GISAID variant analysis
+    """
+    
+    def __init__(self, gisaid_credentials: Dict = None):
+        self.gisaid = GISAIDInterface(
+            username=gisaid_credentials.get('username') if gisaid_credentials else None,
+            password=gisaid_credentials.get('password') if gisaid_credentials else None
+        )
+        self.monitor = RealTimeVariantMonitor(self.gisaid)
+        self.prevalence_tracker = PrevalenceTracker()
+        self.resistance_predictor = AntibodyResistancePredictor()
+        self.alert_system = VariantAlertSystem()
+    
+    def run_surveillance(self,
+                        metadata_file: str,
+                        antibody_sequences: List[str] = None,
+                        output_dir: str = "gisaid_analysis") -> Dict:
+        """
+        Run complete surveillance analysis
+        """
+        print("=" * 70)
+        print("GISAID REAL-TIME SURVEILLANCE PIPELINE")
+        print("=" * 70)
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Load metadata
+        print("\n1. Loading GISAID metadata...")
+        metadata_df = self.gisaid.load_metadata_file(metadata_file)
+        print(f"   Loaded {len(metadata_df)} sequences")
+        print(f"   Date range: {metadata_df['collection_date'].min()} to {metadata_df['collection_date'].max()}")
+        
+        # Current landscape analysis
+        print("\n2. Analyzing current variant landscape...")
+        current_analysis = self.monitor.analyze_current_landscape(metadata_df)
+        print(f"   Found {len(current_analysis['lineage_counts'])} active lineages")
+        print(f"   Geographic spread: {current_analysis['countries']} countries")
+        
+        # Detect emerging threats
+        print("\n3. Detecting emerging threats...")
+        threats = self.monitor.detect_emerging_threats(metadata_df)
+        print(f"   Identified {len(threats)} emerging threats")
+        
+        if threats:
+            print("\n   Top Threats:")
+            for threat in threats[:5]:
+                print(f"   - {threat.lineage}: {threat.threat_level} "
+                     f"(growth: {threat.growth_rate:.2f}, spread: {threat.geographic_spread} countries)")
+        
+        # Calculate prevalence
+        print("\n4. Tracking prevalence over time...")
+        prevalence_df = self.prevalence_tracker.update_prevalence(metadata_df)
+        self.prevalence_tracker.plot_prevalence_timeline(
+            prevalence_df, 
+            save_path=os.path.join(output_dir, "prevalence_timeline.html")
+        )
+        
+        # Geographic distribution
+        print("\n5. Mapping geographic distribution...")
+        self.prevalence_tracker.plot_geographic_distribution(
+            metadata_df,
+            save_path=os.path.join(output_dir, "geographic_distribution.html")
+        )
+        
+        # Antibody resistance predictions
+        resistance_predictions = {}
+        if antibody_sequences:
+            print("\n6. Predicting antibody resistance...")
+            for i, ab_seq in enumerate(antibody_sequences):
+                print(f"   Analyzing antibody {i+1}/{len(antibody_sequences)}")
+                
+                ab_resistance = {}
+                for threat in threats[:10]:  # Top 10 threats
+                    resistance = self.resistance_predictor.predict_antibody_resistance(
+                        threat.key_mutations
+                    )
+                    ab_resistance[threat.lineage] = resistance
+                
+                resistance_predictions[f"Antibody_{i+1}"] = ab_resistance
+        
+        # Check alerts
+        print("\n7. Checking surveillance alerts...")
+        alerts = self.alert_system.check_alerts(current_analysis)
+        print(f"   Generated {len(alerts)} alerts")
+        
+        # Generate reports
+        print("\n8. Generating reports...")
+        self._generate_surveillance_report(
+            current_analysis, threats, alerts, resistance_predictions,
+            os.path.join(output_dir, "surveillance_report.txt")
+        )
+        
+        self.alert_system.generate_alert_report(
+            os.path.join(output_dir, "variant_alerts.txt")
+        )
+        
+        print("\n" + "=" * 70)
+        print("SURVEILLANCE COMPLETE")
+        print("=" * 70)
+        
+        return {
+            'current_analysis': current_analysis,
+            'emerging_threats': threats,
+            'prevalence_data': prevalence_df,
+            'resistance_predictions': resistance_predictions,
+            'alerts': alerts
+        }
+    
+    def _generate_surveillance_report(self,
+                                     current_analysis: Dict,
+                                     threats: List[EmergingThreat],
+                                     alerts: List[Dict],
+                                     resistance_predictions: Dict,
+                                     save_path: str):
+        """
+        Generate comprehensive surveillance report
+        """
+        report = f"""
+GISAID SURVEILLANCE REPORT
+==========================
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+CURRENT LANDSCAPE
+-----------------
+Total Sequences Analyzed: {current_analysis['total_sequences']}
+Countries Represented: {current_analysis['countries']}
+Active Lineages: {len(current_analysis['lineage_counts'])}
+
+TOP 5 CIRCULATING LINEAGES:
+"""
+        
+        # Top lineages
+        sorted_lineages = sorted(current_analysis['lineage_counts'].items(), 
+                                key=lambda x: x[1], reverse=True)[:5]
+        for lineage, count in sorted_lineages:
+            prevalence = count / current_analysis['total_sequences'] * 100
+            report += f"  - {lineage}: {count} sequences ({prevalence:.1f}%)\n"
+        
+        # Emerging threats
+        report += f"""
+EMERGING THREATS
+----------------
+Total Identified: {len(threats)}
+
+"""
+        for i, threat in enumerate(threats[:5], 1):
+            report += f"{i}. {threat.lineage} - {threat.threat_level} Risk\n"
+            report += f"   Growth Rate: {threat.growth_rate:.2f}/week\n"
+            report += f"   Geographic Spread: {threat.geographic_spread} countries\n"
+            report += f"   Escape Score: {threat.antibody_escape_score:.2f}\n"
+            report += f"   Key Mutations: {', '.join(threat.key_mutations[:5])}\n\n"
+        
+        # Alerts
+        report += f"""
+ACTIVE ALERTS
+-------------
+Total Alerts: {len(alerts)}
+High Severity: {sum(1 for a in alerts if a['severity'] == 'HIGH')}
+Medium Severity: {sum(1 for a in alerts if a['severity'] == 'MEDIUM')}
+
+"""
+        
+        # Resistance predictions
+        if resistance_predictions:
+            report += """
+ANTIBODY RESISTANCE PREDICTIONS
+-------------------------------
+"""
+            for ab_name, predictions in resistance_predictions.items():
+                report += f"\n{ab_name}:\n"
+                
+                high_risk = [l for l, p in predictions.items() 
+                           if p['resistance_level'] == 'High']
+                if high_risk:
+                    report += f"  High Risk Variants: {', '.join(high_risk)}\n"
+                
+                moderate_risk = [l for l, p in predictions.items() 
+                               if p['resistance_level'] == 'Moderate']
+                if moderate_risk:
+                    report += f"  Moderate Risk: {', '.join(moderate_risk)}\n"
+        
+        report += """
+RECOMMENDATIONS
+--------------
+1. Monitor high-growth lineages for increased transmission
+2. Update antibody panels to include emerging threats
+3. Conduct neutralization assays against new variants
+4. Review vaccine composition for variant coverage
+5. Implement enhanced genomic surveillance in affected regions
+
+GENERATED FILES
+--------------
+- prevalence_timeline.html: Interactive prevalence timeline
+- geographic_distribution.html: Global distribution map
+- variant_alerts.txt: Alert notifications
+- surveillance_report.txt: This report
+
+"""
+        
+        with open(save_path, 'w') as f:
+            f.write(report)
+        
+        return report
+
+# ==========================================
+# 8. DEMO WITH SAMPLE DATA
+# ==========================================
+
+def create_sample_gisaid_data(num_samples: int = 1000) -> pd.DataFrame:
+    """
+    Create sample GISAID-like data for demonstration
+    """
+    np.random.seed(42)
+    
+    # Lineages with different growth patterns
+    lineages = ['BA.5', 'BA.2.75', 'XBB.1.5', 'XBB.1.16', 'EG.5', 'BA.2.86', 'JN.1']
+    countries = ['USA', 'UK', 'Germany', 'France', 'Japan', 'Brazil', 'India', 
+                 'South Africa', 'Australia', 'Canada']
+    
+    data = []
+    base_date = datetime(2023, 1, 1)
+    
+    for i in range(num_samples):
+        # Create temporal patterns
+        days_offset = np.random.randint(0, 365)
+        collection_date = base_date + timedelta(days=days_offset)
+        
+        # Lineage distribution changes over time
+        if days_offset < 90:
+            lineage_weights = [0.4, 0.3, 0.2, 0.05, 0.03, 0.01, 0.01]
+        elif days_offset < 180:
+            lineage_weights = [0.2, 0.2, 0.3, 0.15, 0.1, 0.03, 0.02]
+        elif days_offset < 270:
+            lineage_weights = [0.1, 0.1, 0.2, 0.2, 0.25, 0.1, 0.05]
+        else:
+            lineage_weights = [0.05, 0.05, 0.1, 0.15, 0.2, 0.2, 0.25]
+        
+        lineage = np.random.choice(lineages, p=lineage_weights/np.sum(lineage_weights))
+        
+        # Generate mutations based on lineage
+        spike_mutations = []
+        if lineage in ['XBB.1.5', 'XBB.1.16']:
+            spike_mutations.extend(['S:F486P', 'S:F490S'])
+        if lineage in ['BA.2.86', 'JN.1']:
+            spike_mutations.extend(['S:L455S', 'S:F456L'])
+        if lineage == 'JN.1':
+            spike_mutations.append('S:L455W')
+        
+        # Add random mutations
+        if np.random.random() < 0.3:
+            spike_mutations.append(f'S:{np.random.choice(["K", "N", "E", "D"])}'
+                                 f'{np.random.randint(400, 510)}'
+                                 f'{np.random.choice(["A", "T", "V", "R"])}')
+        
+        data.append({
+            'virus_name': f'hCoV-19/{np.random.choice(countries)}/{i}/2023',
+            'accession_id': f'EPI_ISL_{1000000 + i}',
+            'collection_date': collection_date,
+            'submission_date': collection_date + timedelta(days=np.random.randint(1, 30)),
+            'country': np.random.choice(countries),
+            'pango_lineage': lineage,
+            'aa_substitutions': ','.join(spike_mutations),
+            'host': 'Human',
+            'age': np.random.randint(1, 90) if np.random.random() < 0.8 else np.nan,
+            'sex': np.random.choice(['Male', 'Female']) if np.random.random() < 0.7 else np.nan
+        })
+    
+    return pd.DataFrame(data)
+
+def demo_gisaid_analysis():
+    """
+    Demonstrate GISAID analysis with sample data
+    """
+    print("Creating sample GISAID data for demonstration...")
+    
+    # Create sample data
+    sample_df = create_sample_gisaid_data(2000)
+    
+    # Save to temporary file
+    temp_file = "sample_gisaid_metadata.csv"
+    sample_df.to_csv(temp_file, index=False)
+    
+    # Initialize pipeline (no real credentials for demo)
+    pipeline = GISAIDAnalysisPipeline()
+    
+    # Run surveillance
+    results = pipeline.run_surveillance(
+        metadata_file=temp_file,
+        antibody_sequences=["SAMPLE_ANTIBODY_SEQUENCE"],
+        output_dir="gisaid_demo_output"
+    )
+    
+    print("\n✓ GISAID analysis demonstration complete!")
+    print("Check 'gisaid_demo_output' directory for results.")
+    
+    # Clean up
+    os.remove(temp_file)
+    
+    return results
+
+if __name__ == "__main__":
+    results = demo_gisaid_analysis()

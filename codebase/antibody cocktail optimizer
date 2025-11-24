@@ -1,0 +1,1433 @@
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL v5: Antibody Cocktail Optimization Engine
+Advanced algorithms for designing optimal antibody combinations
+
+Features:
+- Multi-objective optimization for cocktail design
+- Synergy and antagonism prediction
+- Epitope binning and competition analysis
+- Resistance pathway blocking
+- Dose optimization algorithms
+- Manufacturing cost consideration
+- Evolutionary escape modeling
+- Clinical efficacy prediction
+
+Author: EJ
+Date: November 2024
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional, Set, Any
+from dataclasses import dataclass, field
+from collections import defaultdict
+import itertools
+from scipy.optimize import minimize, differential_evolution, LinearConstraint
+from scipy.spatial.distance import cdist, pdist, squareform
+from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import networkx as nx
+from deap import base, creator, tools, algorithms
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. DATA STRUCTURES
+# ==========================================
+
+@dataclass
+class Antibody:
+    """Complete antibody characterization"""
+    id: str
+    sequence: str
+    epitope_bin: str
+    ic50: float  # nM
+    neutralization_breadth: float  # 0-1
+    escape_mutations: List[str]
+    production_cost: float  # $/mg
+    stability: float  # days at 37°C
+    immunogenicity_risk: float  # 0-1
+    clinical_data: Optional[Dict] = None
+    structure_available: bool = False
+    binding_kinetics: Optional[Dict] = None  # ka, kd, KD
+    
+    def __hash__(self):
+        return hash(self.id)
+
+@dataclass
+class Variant:
+    """Viral variant characteristics"""
+    name: str
+    mutations: List[str]
+    prevalence: float
+    growth_rate: float
+    geographic_distribution: List[str]
+    escape_profile: Dict[str, float]  # antibody_id -> fold_reduction
+
+@dataclass
+class CocktailCandidate:
+    """Antibody cocktail candidate"""
+    antibodies: List[Antibody]
+    coverage_score: float
+    resistance_barrier: float
+    synergy_score: float
+    cost: float
+    predicted_efficacy: float
+    escape_pathways_blocked: int
+    optimization_metrics: Dict[str, float] = field(default_factory=dict)
+
+@dataclass
+class EpitopeBin:
+    """Epitope bin definition"""
+    id: str
+    name: str
+    residues: List[int]
+    conservation: float  # 0-1 across variants
+    accessibility: float  # 0-1 for antibody binding
+    escape_rate: float  # historical escape frequency
+    structural_region: str  # RBD, NTD, S2, etc.
+
+# ==========================================
+# 2. EPITOPE BINNING & COMPETITION
+# ==========================================
+
+class EpitopeBinner:
+    """
+    Determine epitope bins and competition groups
+    """
+    
+    def __init__(self):
+        self.bins = self._initialize_epitope_bins()
+        self.competition_matrix = None
+    
+    def _initialize_epitope_bins(self) -> Dict[str, EpitopeBin]:
+        """Initialize known epitope bins"""
+        bins = {
+            'RBD-1': EpitopeBin(
+                id='RBD-1',
+                name='Class 1 RBD',
+                residues=list(range(403, 420)) + list(range(453, 460)),
+                conservation=0.7,
+                accessibility=0.9,
+                escape_rate=0.3,
+                structural_region='RBD'
+            ),
+            'RBD-2': EpitopeBin(
+                id='RBD-2',
+                name='Class 2 RBD',
+                residues=list(range(483, 487)) + list(range(490, 495)),
+                conservation=0.6,
+                accessibility=0.8,
+                escape_rate=0.4,
+                structural_region='RBD'
+            ),
+            'RBD-3': EpitopeBin(
+                id='RBD-3',
+                name='Class 3 RBD',
+                residues=list(range(437, 452)),
+                conservation=0.8,
+                accessibility=0.7,
+                escape_rate=0.2,
+                structural_region='RBD'
+            ),
+            'RBD-4': EpitopeBin(
+                id='RBD-4',
+                name='Class 4 RBD',
+                residues=list(range(365, 380)),
+                conservation=0.9,
+                accessibility=0.6,
+                escape_rate=0.1,
+                structural_region='RBD'
+            ),
+            'NTD-1': EpitopeBin(
+                id='NTD-1',
+                name='NTD Supersite',
+                residues=list(range(14, 20)) + list(range(140, 158)),
+                conservation=0.5,
+                accessibility=0.9,
+                escape_rate=0.5,
+                structural_region='NTD'
+            ),
+            'S2-1': EpitopeBin(
+                id='S2-1',
+                name='S2 Stem Helix',
+                residues=list(range(1140, 1160)),
+                conservation=0.95,
+                accessibility=0.4,
+                escape_rate=0.05,
+                structural_region='S2'
+            )
+        }
+        return bins
+    
+    def calculate_competition_matrix(self, antibodies: List[Antibody]) -> np.ndarray:
+        """
+        Calculate competition matrix between antibodies
+        Returns matrix where 1 = complete competition, 0 = no competition
+        """
+        n = len(antibodies)
+        competition = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                # Same epitope bin = high competition
+                if antibodies[i].epitope_bin == antibodies[j].epitope_bin:
+                    competition[i, j] = competition[j, i] = 0.9
+                # Adjacent bins = partial competition
+                elif self._are_adjacent_bins(antibodies[i].epitope_bin, 
+                                            antibodies[j].epitope_bin):
+                    competition[i, j] = competition[j, i] = 0.3
+                # Different regions = no competition
+                else:
+                    competition[i, j] = competition[j, i] = 0.0
+        
+        self.competition_matrix = competition
+        return competition
+    
+    def _are_adjacent_bins(self, bin1: str, bin2: str) -> bool:
+        """Check if two epitope bins are adjacent"""
+        if bin1 not in self.bins or bin2 not in self.bins:
+            return False
+        
+        # Check residue overlap
+        residues1 = set(self.bins[bin1].residues)
+        residues2 = set(self.bins[bin2].residues)
+        
+        # Consider adjacent if within 10 residues
+        for r1 in residues1:
+            for r2 in residues2:
+                if abs(r1 - r2) < 10:
+                    return True
+        return False
+    
+    def identify_non_competing_sets(self, antibodies: List[Antibody], 
+                                   threshold: float = 0.3) -> List[Set[Antibody]]:
+        """
+        Identify sets of non-competing antibodies
+        """
+        competition = self.calculate_competition_matrix(antibodies)
+        n = len(antibodies)
+        
+        # Use graph coloring approach
+        G = nx.Graph()
+        for i in range(n):
+            G.add_node(i)
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                if competition[i, j] > threshold:
+                    G.add_edge(i, j)
+        
+        # Find independent sets (non-competing groups)
+        non_competing_sets = []
+        cliques = list(nx.find_cliques(nx.complement(G)))
+        
+        for clique in cliques:
+            ab_set = {antibodies[i] for i in clique}
+            non_competing_sets.append(ab_set)
+        
+        return non_competing_sets
+
+# ==========================================
+# 3. SYNERGY PREDICTION
+# ==========================================
+
+class SynergyPredictor(nn.Module):
+    """
+    Neural network for predicting antibody synergy
+    """
+    
+    def __init__(self, input_dim: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        
+        # Antibody encoders
+        self.ab_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2)
+        )
+        
+        # Interaction layers
+        self.interaction = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU()
+        )
+        
+        # Synergy predictor
+        self.synergy_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, ab1_features: torch.Tensor, 
+                ab2_features: torch.Tensor) -> torch.Tensor:
+        """Predict synergy between two antibodies"""
+        # Encode antibodies
+        ab1_encoded = self.ab_encoder(ab1_features)
+        ab2_encoded = self.ab_encoder(ab2_features)
+        
+        # Combine features
+        combined = torch.cat([ab1_encoded, ab2_encoded], dim=-1)
+        
+        # Process interaction
+        interaction_features = self.interaction(combined)
+        
+        # Predict synergy
+        synergy = self.synergy_head(interaction_features)
+        
+        return torch.sigmoid(synergy)
+
+class SynergyAnalyzer:
+    """
+    Analyze and predict synergistic effects in cocktails
+    """
+    
+    def __init__(self, model: Optional[SynergyPredictor] = None):
+        self.model = model or SynergyPredictor()
+        self.synergy_cache = {}
+    
+    def calculate_pairwise_synergy(self, ab1: Antibody, ab2: Antibody) -> float:
+        """
+        Calculate synergy score between two antibodies
+        """
+        # Check cache
+        key = tuple(sorted([ab1.id, ab2.id]))
+        if key in self.synergy_cache:
+            return self.synergy_cache[key]
+        
+        # Feature-based synergy calculation
+        synergy = 0.0
+        
+        # 1. Epitope complementarity
+        if ab1.epitope_bin != ab2.epitope_bin:
+            synergy += 0.3
+            
+            # Bonus for covering different regions
+            if self._different_regions(ab1.epitope_bin, ab2.epitope_bin):
+                synergy += 0.2
+        
+        # 2. Escape mutation coverage
+        escape1 = set(ab1.escape_mutations)
+        escape2 = set(ab2.escape_mutations)
+        
+        # Non-overlapping escape = good synergy
+        overlap_ratio = len(escape1.intersection(escape2)) / max(len(escape1.union(escape2)), 1)
+        synergy += (1 - overlap_ratio) * 0.3
+        
+        # 3. Neutralization breadth complementarity
+        breadth_complement = abs(ab1.neutralization_breadth - ab2.neutralization_breadth)
+        if breadth_complement > 0.3:  # Different breadths = complementary
+            synergy += 0.2
+        
+        # Cache result
+        self.synergy_cache[key] = synergy
+        return synergy
+    
+    def calculate_cocktail_synergy(self, antibodies: List[Antibody]) -> float:
+        """
+        Calculate overall synergy for a cocktail
+        """
+        if len(antibodies) < 2:
+            return 0.0
+        
+        total_synergy = 0.0
+        pairs = 0
+        
+        for i in range(len(antibodies)):
+            for j in range(i+1, len(antibodies)):
+                pairwise = self.calculate_pairwise_synergy(antibodies[i], antibodies[j])
+                total_synergy += pairwise
+                pairs += 1
+        
+        # Average synergy with multi-antibody bonus
+        avg_synergy = total_synergy / pairs if pairs > 0 else 0
+        
+        # Bonus for 3+ antibodies (emergent properties)
+        if len(antibodies) >= 3:
+            avg_synergy *= 1.1
+        
+        return min(1.0, avg_synergy)
+    
+    def _different_regions(self, bin1: str, bin2: str) -> bool:
+        """Check if bins are in different structural regions"""
+        region1 = bin1.split('-')[0] if '-' in bin1 else bin1
+        region2 = bin2.split('-')[0] if '-' in bin2 else bin2
+        return region1 != region2
+
+# ==========================================
+# 4. RESISTANCE BARRIER CALCULATOR
+# ==========================================
+
+class ResistanceBarrierCalculator:
+    """
+    Calculate genetic barrier to resistance
+    """
+    
+    def __init__(self):
+        self.mutation_fitness_costs = self._load_fitness_costs()
+        self.escape_pathways = defaultdict(list)
+    
+    def _load_fitness_costs(self) -> Dict[str, float]:
+        """Load known fitness costs of mutations"""
+        return {
+            'S:K417N': 0.15,
+            'S:K417T': 0.12,
+            'S:L452R': 0.08,
+            'S:E484K': 0.10,
+            'S:E484A': 0.09,
+            'S:N501Y': 0.05,
+            'S:P681H': 0.03,
+            'S:D614G': -0.10,  # Fitness advantage
+        }
+    
+    def calculate_resistance_barrier(self, 
+                                    cocktail: List[Antibody],
+                                    variants: List[Variant]) -> Dict[str, Any]:
+        """
+        Calculate the genetic barrier to resistance for a cocktail
+        """
+        results = {
+            'overall_barrier': 0.0,
+            'escape_pathways': [],
+            'minimum_mutations_required': 0,
+            'fitness_valley_depth': 0.0
+        }
+        
+        # Identify all escape mutations for each antibody
+        escape_sets = []
+        for ab in cocktail:
+            escape_sets.append(set(ab.escape_mutations))
+        
+        # Find minimal escape pathway (mutations to escape all antibodies)
+        all_mutations = set().union(*escape_sets)
+        
+        # Calculate minimum mutations needed
+        min_mutations_needed = self._find_minimal_escape_set(escape_sets)
+        results['minimum_mutations_required'] = len(min_mutations_needed)
+        
+        # Calculate fitness cost of escape pathway
+        total_fitness_cost = 0
+        for mutation in min_mutations_needed:
+            if mutation in self.mutation_fitness_costs:
+                total_fitness_cost += self.mutation_fitness_costs[mutation]
+            else:
+                total_fitness_cost += 0.1  # Default cost
+        
+        results['fitness_valley_depth'] = total_fitness_cost
+        
+        # Overall barrier score (higher is better)
+        # Based on: number of mutations needed + fitness cost
+        results['overall_barrier'] = (
+            len(min_mutations_needed) * 0.3 +  # Each mutation adds barrier
+            min(total_fitness_cost, 1.0) * 0.7  # Fitness cost component
+        )
+        
+        # Identify escape pathways
+        pathways = self._enumerate_escape_pathways(escape_sets, variants)
+        results['escape_pathways'] = pathways[:5]  # Top 5 pathways
+        
+        return results
+    
+    def _find_minimal_escape_set(self, escape_sets: List[Set[str]]) -> Set[str]:
+        """
+        Find minimal set of mutations to escape all antibodies
+        """
+        # This is a set cover problem - using greedy approximation
+        uncovered = list(range(len(escape_sets)))
+        selected_mutations = set()
+        
+        while uncovered:
+            best_mutation = None
+            best_coverage = 0
+            
+            # Find mutation that covers most uncovered antibodies
+            all_mutations = set().union(*[escape_sets[i] for i in uncovered])
+            
+            for mutation in all_mutations:
+                coverage = sum(1 for i in uncovered if mutation in escape_sets[i])
+                if coverage > best_coverage:
+                    best_coverage = coverage
+                    best_mutation = mutation
+            
+            if best_mutation:
+                selected_mutations.add(best_mutation)
+                uncovered = [i for i in uncovered if best_mutation not in escape_sets[i]]
+            else:
+                break
+        
+        return selected_mutations
+    
+    def _enumerate_escape_pathways(self, 
+                                  escape_sets: List[Set[str]],
+                                  variants: List[Variant]) -> List[Dict]:
+        """
+        Enumerate possible escape pathways
+        """
+        pathways = []
+        
+        for variant in variants:
+            variant_mutations = set(variant.mutations)
+            
+            # Check how many antibodies this variant escapes
+            escaped_antibodies = []
+            for i, escape_set in enumerate(escape_sets):
+                if variant_mutations.intersection(escape_set):
+                    escaped_antibodies.append(i)
+            
+            if escaped_antibodies:
+                pathway = {
+                    'variant': variant.name,
+                    'mutations': list(variant_mutations),
+                    'antibodies_escaped': escaped_antibodies,
+                    'escape_fraction': len(escaped_antibodies) / len(escape_sets),
+                    'variant_prevalence': variant.prevalence
+                }
+                pathways.append(pathway)
+        
+        # Sort by escape fraction and prevalence
+        pathways.sort(key=lambda x: (x['escape_fraction'], x['variant_prevalence']), 
+                     reverse=True)
+        
+        return pathways
+
+# ==========================================
+# 5. MULTI-OBJECTIVE OPTIMIZATION
+# ==========================================
+
+class CocktailOptimizer:
+    """
+    Multi-objective optimization for cocktail design
+    """
+    
+    def __init__(self):
+        self.epitope_binner = EpitopeBinner()
+        self.synergy_analyzer = SynergyAnalyzer()
+        self.resistance_calculator = ResistanceBarrierCalculator()
+        
+        # Optimization weights (adjustable)
+        self.weights = {
+            'coverage': 0.3,
+            'resistance_barrier': 0.25,
+            'synergy': 0.15,
+            'cost': 0.15,
+            'breadth': 0.15
+        }
+    
+    def optimize_cocktail(self,
+                         antibody_library: List[Antibody],
+                         variants: List[Variant],
+                         constraints: Dict[str, Any] = None) -> List[CocktailCandidate]:
+        """
+        Find optimal antibody cocktails using multi-objective optimization
+        """
+        constraints = constraints or {
+            'max_antibodies': 3,
+            'max_cost': 1000,
+            'min_coverage': 0.8
+        }
+        
+        # Use genetic algorithm for optimization
+        candidates = self._genetic_algorithm_optimization(
+            antibody_library, variants, constraints
+        )
+        
+        # Rank candidates
+        ranked_candidates = self._rank_candidates(candidates)
+        
+        return ranked_candidates[:10]  # Return top 10
+    
+    def _genetic_algorithm_optimization(self,
+                                       antibody_library: List[Antibody],
+                                       variants: List[Variant],
+                                       constraints: Dict) -> List[CocktailCandidate]:
+        """
+        Use genetic algorithm for cocktail optimization
+        """
+        # Setup DEAP framework
+        if 'FitnessMax' not in dir(creator):
+            creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        if 'Individual' not in dir(creator):
+            creator.create("Individual", list, fitness=creator.FitnessMax)
+        
+        toolbox = base.Toolbox()
+        
+        # Genetic operators
+        toolbox.register("attr_antibody", np.random.choice, antibody_library)
+        toolbox.register("individual", tools.initRepeat, creator.Individual,
+                        toolbox.attr_antibody, n=constraints['max_antibodies'])
+        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+        
+        # Fitness function
+        def evaluate_cocktail(individual):
+            # Remove duplicates
+            unique_abs = list(set(individual))
+            
+            if len(unique_abs) == 0:
+                return (0.0,)
+            
+            # Calculate metrics
+            coverage = self._calculate_coverage(unique_abs, variants)
+            resistance = self.resistance_calculator.calculate_resistance_barrier(
+                unique_abs, variants
+            )['overall_barrier']
+            synergy = self.synergy_analyzer.calculate_cocktail_synergy(unique_abs)
+            cost = sum(ab.production_cost for ab in unique_abs)
+            breadth = np.mean([ab.neutralization_breadth for ab in unique_abs])
+            
+            # Check constraints
+            if cost > constraints['max_cost']:
+                return (0.0,)
+            if coverage < constraints['min_coverage']:
+                return (0.0,)
+            
+            # Weighted fitness
+            fitness = (
+                self.weights['coverage'] * coverage +
+                self.weights['resistance_barrier'] * resistance +
+                self.weights['synergy'] * synergy +
+                self.weights['cost'] * (1 - cost/constraints['max_cost']) +
+                self.weights['breadth'] * breadth
+            )
+            
+            return (fitness,)
+        
+        toolbox.register("evaluate", evaluate_cocktail)
+        toolbox.register("mate", tools.cxUniform, indpb=0.5)
+        toolbox.register("mutate", self._mutate_cocktail, 
+                        antibody_library=antibody_library, indpb=0.2)
+        toolbox.register("select", tools.selTournament, tournsize=3)
+        
+        # Run optimization
+        population = toolbox.population(n=100)
+        
+        # Evaluate initial population
+        fitnesses = list(map(toolbox.evaluate, population))
+        for ind, fit in zip(population, fitnesses):
+            ind.fitness.values = fit
+        
+        # Evolution
+        for gen in range(50):  # 50 generations
+            # Selection
+            offspring = toolbox.select(population, len(population))
+            offspring = list(map(toolbox.clone, offspring))
+            
+            # Crossover
+            for child1, child2 in zip(offspring[::2], offspring[1::2]):
+                if np.random.random() < 0.5:
+                    toolbox.mate(child1, child2)
+                    del child1.fitness.values
+                    del child2.fitness.values
+            
+            # Mutation
+            for mutant in offspring:
+                if np.random.random() < 0.2:
+                    toolbox.mutate(mutant)
+                    del mutant.fitness.values
+            
+            # Evaluate new individuals
+            invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+            fitnesses = map(toolbox.evaluate, invalid_ind)
+            for ind, fit in zip(invalid_ind, fitnesses):
+                ind.fitness.values = fit
+            
+            # Replace population
+            population[:] = offspring
+        
+        # Convert to CocktailCandidates
+        candidates = []
+        for individual in population:
+            if individual.fitness.values[0] > 0:
+                unique_abs = list(set(individual))
+                candidate = self._create_cocktail_candidate(unique_abs, variants)
+                candidates.append(candidate)
+        
+        return candidates
+    
+    def _mutate_cocktail(self, individual, antibody_library, indpb):
+        """Custom mutation for cocktail optimization"""
+        for i in range(len(individual)):
+            if np.random.random() < indpb:
+                individual[i] = np.random.choice(antibody_library)
+        return individual,
+    
+    def _calculate_coverage(self, antibodies: List[Antibody], 
+                           variants: List[Variant]) -> float:
+        """Calculate variant coverage for a cocktail"""
+        covered_variants = 0
+        
+        for variant in variants:
+            # Check if any antibody covers this variant
+            variant_covered = False
+            for ab in antibodies:
+                if ab.id not in variant.escape_profile:
+                    # No escape data = assume coverage
+                    variant_covered = True
+                    break
+                elif variant.escape_profile[ab.id] < 10:  # <10-fold reduction
+                    variant_covered = True
+                    break
+            
+            if variant_covered:
+                # Weight by variant prevalence
+                covered_variants += variant.prevalence
+        
+        total_prevalence = sum(v.prevalence for v in variants)
+        return covered_variants / max(total_prevalence, 1.0)
+    
+    def _create_cocktail_candidate(self, antibodies: List[Antibody], 
+                                  variants: List[Variant]) -> CocktailCandidate:
+        """Create a cocktail candidate with all metrics"""
+        coverage = self._calculate_coverage(antibodies, variants)
+        resistance = self.resistance_calculator.calculate_resistance_barrier(
+            antibodies, variants
+        )
+        synergy = self.synergy_analyzer.calculate_cocktail_synergy(antibodies)
+        cost = sum(ab.production_cost for ab in antibodies)
+        
+        # Predict clinical efficacy (simplified model)
+        efficacy = (coverage * 0.4 + 
+                   resistance['overall_barrier'] * 0.3 +
+                   synergy * 0.2 +
+                   np.mean([ab.neutralization_breadth for ab in antibodies]) * 0.1)
+        
+        return CocktailCandidate(
+            antibodies=antibodies,
+            coverage_score=coverage,
+            resistance_barrier=resistance['overall_barrier'],
+            synergy_score=synergy,
+            cost=cost,
+            predicted_efficacy=efficacy,
+            escape_pathways_blocked=len(resistance.get('escape_pathways', [])),
+            optimization_metrics={
+                'fitness': coverage * 0.3 + resistance['overall_barrier'] * 0.3 + synergy * 0.2,
+                'diversity': len(set(ab.epitope_bin for ab in antibodies)),
+                'stability': min(ab.stability for ab in antibodies)
+            }
+        )
+    
+    def _rank_candidates(self, candidates: List[CocktailCandidate]) -> List[CocktailCandidate]:
+        """Rank candidates using Pareto optimality"""
+        # Simple ranking by overall score
+        for candidate in candidates:
+            candidate.optimization_metrics['overall_score'] = (
+                candidate.coverage_score * self.weights['coverage'] +
+                candidate.resistance_barrier * self.weights['resistance_barrier'] +
+                candidate.synergy_score * self.weights['synergy'] +
+                (1 - candidate.cost/1000) * self.weights['cost'] +
+                candidate.predicted_efficacy * self.weights['breadth']
+            )
+        
+        candidates.sort(key=lambda x: x.optimization_metrics['overall_score'], 
+                       reverse=True)
+        
+        return candidates
+
+# ==========================================
+# 6. DOSE OPTIMIZATION
+# ==========================================
+
+class DoseOptimizer:
+    """
+    Optimize dosing for cocktail components
+    """
+    
+    def __init__(self):
+        self.pk_model = self._initialize_pk_model()
+    
+    def _initialize_pk_model(self) -> Dict:
+        """Initialize pharmacokinetic model parameters"""
+        return {
+            'volume_distribution': 5.0,  # L
+            'clearance': 0.2,  # L/day
+            'bioavailability': 0.8,
+            'half_life': 21  # days (typical for IgG)
+        }
+    
+    def optimize_doses(self, 
+                      cocktail: CocktailCandidate,
+                      target_coverage: float = 0.9,
+                      duration_days: int = 28) -> Dict[str, float]:
+        """
+        Optimize individual antibody doses in cocktail
+        """
+        doses = {}
+        
+        # Base dose calculation
+        for ab in cocktail.antibodies:
+            # Target concentration = 10x IC50
+            target_conc = ab.ic50 * 10
+            
+            # Account for half-life and clearance
+            dose_mg = self._calculate_dose(
+                target_conc, 
+                self.pk_model['volume_distribution'],
+                self.pk_model['clearance'],
+                duration_days
+            )
+            
+            # Adjust for synergy (can use lower doses)
+            if cocktail.synergy_score > 0.5:
+                dose_mg *= (1 - cocktail.synergy_score * 0.2)
+            
+            doses[ab.id] = dose_mg
+        
+        # Optimize ratio for maximum effect
+        optimized_doses = self._optimize_ratio(doses, cocktail)
+        
+        return optimized_doses
+    
+    def _calculate_dose(self, target_conc: float, volume: float, 
+                       clearance: float, duration: int) -> float:
+        """Calculate required dose based on PK parameters"""
+        # Simple one-compartment model
+        ke = clearance / volume  # Elimination constant
+        
+        # Dose to maintain target concentration
+        dose = target_conc * volume * (1 - np.exp(-ke * duration))
+        
+        return dose
+    
+    def _optimize_ratio(self, initial_doses: Dict[str, float], 
+                       cocktail: CocktailCandidate) -> Dict[str, float]:
+        """Optimize dose ratios for maximum efficacy"""
+        # Use competition and synergy to adjust ratios
+        competition_matrix = self._get_competition_matrix(cocktail.antibodies)
+        
+        # Adjust doses based on competition
+        optimized = initial_doses.copy()
+        
+        for i, ab1 in enumerate(cocktail.antibodies):
+            competition_sum = 0
+            for j, ab2 in enumerate(cocktail.antibodies):
+                if i != j:
+                    competition_sum += competition_matrix[i, j]
+            
+            # Increase dose if high competition
+            if competition_sum > 0.5:
+                optimized[ab1.id] *= 1.2
+        
+        return optimized
+    
+    def _get_competition_matrix(self, antibodies: List[Antibody]) -> np.ndarray:
+        """Get competition matrix for antibodies"""
+        binner = EpitopeBinner()
+        return binner.calculate_competition_matrix(antibodies)
+
+# ==========================================
+# 7. CLINICAL EFFICACY PREDICTOR
+# ==========================================
+
+class ClinicalEfficacyPredictor:
+    """
+    Predict clinical efficacy based on in vitro data
+    """
+    
+    def __init__(self):
+        self.model = self._build_model()
+        self.historical_data = self._load_historical_data()
+    
+    def _build_model(self) -> RandomForestRegressor:
+        """Build ML model for efficacy prediction"""
+        # In production, would be trained on real clinical data
+        model = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42
+        )
+        return model
+    
+    def _load_historical_data(self) -> pd.DataFrame:
+        """Load historical clinical trial data"""
+        # Simulated data for demonstration
+        data = {
+            'neutralization_ic50': [10, 50, 100, 5, 20],
+            'breadth': [0.8, 0.6, 0.4, 0.9, 0.7],
+            'escape_mutations': [2, 5, 8, 1, 3],
+            'clinical_efficacy': [0.85, 0.65, 0.45, 0.92, 0.75]
+        }
+        return pd.DataFrame(data)
+    
+    def predict_efficacy(self, cocktail: CocktailCandidate) -> Dict[str, float]:
+        """
+        Predict clinical efficacy metrics
+        """
+        features = self._extract_features(cocktail)
+        
+        # Simplified prediction model
+        base_efficacy = cocktail.predicted_efficacy
+        
+        # Adjust based on cocktail properties
+        adjustments = {
+            'viral_load_reduction': base_efficacy * 2.5,  # log10 reduction
+            'hospitalization_prevention': base_efficacy * 0.85,
+            'symptom_duration_reduction': base_efficacy * 3.5,  # days
+            'transmission_reduction': base_efficacy * 0.7
+        }
+        
+        # Account for resistance barrier
+        if cocktail.resistance_barrier > 0.7:
+            for key in adjustments:
+                adjustments[key] *= 1.1
+        
+        return adjustments
+    
+    def _extract_features(self, cocktail: CocktailCandidate) -> np.ndarray:
+        """Extract features for ML model"""
+        features = [
+            np.mean([ab.ic50 for ab in cocktail.antibodies]),
+            cocktail.coverage_score,
+            cocktail.resistance_barrier,
+            cocktail.synergy_score,
+            len(cocktail.antibodies),
+            cocktail.escape_pathways_blocked
+        ]
+        return np.array(features).reshape(1, -1)
+
+# ==========================================
+# 8. VISUALIZATION
+# ==========================================
+
+class CocktailVisualizer:
+    """
+    Visualize cocktail optimization results
+    """
+    
+    @staticmethod
+    def plot_cocktail_comparison(candidates: List[CocktailCandidate],
+                                save_path: str = "cocktail_comparison.html"):
+        """
+        Create interactive comparison of cocktail candidates
+        """
+        # Prepare data
+        data = []
+        for i, candidate in enumerate(candidates[:10]):  # Top 10
+            data.append({
+                'Cocktail': f"C{i+1} ({len(candidate.antibodies)} mAbs)",
+                'Coverage': candidate.coverage_score,
+                'Resistance Barrier': candidate.resistance_barrier,
+                'Synergy': candidate.synergy_score,
+                'Cost': candidate.cost,
+                'Efficacy': candidate.predicted_efficacy,
+                'Antibodies': ', '.join([ab.id for ab in candidate.antibodies])
+            })
+        
+        df = pd.DataFrame(data)
+        
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Coverage vs Resistance', 'Cost vs Efficacy',
+                          'Multi-metric Comparison', 'Antibody Composition'),
+            specs=[[{'type': 'scatter'}, {'type': 'scatter'}],
+                  [{'type': 'bar'}, {'type': 'table'}]]
+        )
+        
+        # Scatter plot 1: Coverage vs Resistance
+        fig.add_trace(
+            go.Scatter(x=df['Coverage'], y=df['Resistance Barrier'],
+                      mode='markers+text', text=df['Cocktail'],
+                      textposition='top center',
+                      marker=dict(size=df['Synergy']*20, 
+                                color=df['Efficacy'],
+                                colorscale='Viridis',
+                                showscale=True)),
+            row=1, col=1
+        )
+        
+        # Scatter plot 2: Cost vs Efficacy
+        fig.add_trace(
+            go.Scatter(x=df['Cost'], y=df['Efficacy'],
+                      mode='markers+text', text=df['Cocktail'],
+                      textposition='top center',
+                      marker=dict(size=10)),
+            row=1, col=2
+        )
+        
+        # Bar plot: Multi-metric comparison
+        metrics = ['Coverage', 'Resistance Barrier', 'Synergy', 'Efficacy']
+        for metric in metrics:
+            fig.add_trace(
+                go.Bar(name=metric, x=df['Cocktail'], y=df[metric]),
+                row=2, col=1
+            )
+        
+        # Table: Antibody composition
+        fig.add_trace(
+            go.Table(
+                header=dict(values=['Cocktail', 'Antibodies'],
+                          fill_color='paleturquoise'),
+                cells=dict(values=[df['Cocktail'], df['Antibodies']],
+                         fill_color='lavender')
+            ),
+            row=2, col=2
+        )
+        
+        # Update layout
+        fig.update_layout(
+            title='Antibody Cocktail Optimization Results',
+            showlegend=True,
+            height=800
+        )
+        
+        fig.write_html(save_path)
+        print(f"Interactive comparison saved to {save_path}")
+        
+        return fig
+    
+    @staticmethod
+    def plot_escape_landscape(cocktail: CocktailCandidate,
+                             variants: List[Variant],
+                             save_path: str = "escape_landscape.png"):
+        """
+        Visualize escape mutation landscape
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # 1. Escape pathway network
+        ax = axes[0, 0]
+        G = nx.DiGraph()
+        
+        # Add nodes for antibodies and variants
+        for ab in cocktail.antibodies:
+            G.add_node(ab.id, node_type='antibody')
+        
+        for var in variants[:10]:  # Top variants
+            G.add_node(var.name, node_type='variant')
+        
+        # Add edges for escape
+        for var in variants[:10]:
+            for ab in cocktail.antibodies:
+                if ab.id in var.escape_profile:
+                    if var.escape_profile[ab.id] > 5:  # Significant escape
+                        G.add_edge(var.name, ab.id, 
+                                 weight=var.escape_profile[ab.id])
+        
+        pos = nx.spring_layout(G)
+        
+        # Draw nodes
+        antibody_nodes = [n for n, d in G.nodes(data=True) if d['node_type'] == 'antibody']
+        variant_nodes = [n for n, d in G.nodes(data=True) if d['node_type'] == 'variant']
+        
+        nx.draw_networkx_nodes(G, pos, nodelist=antibody_nodes, 
+                             node_color='blue', node_size=500, ax=ax)
+        nx.draw_networkx_nodes(G, pos, nodelist=variant_nodes, 
+                             node_color='red', node_size=300, ax=ax)
+        nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.5)
+        nx.draw_networkx_labels(G, pos, ax=ax, font_size=8)
+        
+        ax.set_title('Escape Network')
+        ax.axis('off')
+        
+        # 2. Mutation heatmap
+        ax = axes[0, 1]
+        
+        # Create mutation matrix
+        mutations = set()
+        for ab in cocktail.antibodies:
+            mutations.update(ab.escape_mutations)
+        mutations = list(mutations)[:20]  # Top 20
+        
+        matrix = np.zeros((len(cocktail.antibodies), len(mutations)))
+        for i, ab in enumerate(cocktail.antibodies):
+            for j, mut in enumerate(mutations):
+                if mut in ab.escape_mutations:
+                    matrix[i, j] = 1
+        
+        sns.heatmap(matrix, xticklabels=mutations, 
+                   yticklabels=[ab.id for ab in cocktail.antibodies],
+                   cmap='RdYlGn_r', ax=ax)
+        ax.set_title('Escape Mutation Coverage')
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # 3. Resistance barrier
+        ax = axes[1, 0]
+        
+        # Simulate fitness landscape
+        n_mutations = np.arange(0, 6)
+        fitness = np.exp(-n_mutations * 0.3) * 100  # Decreasing fitness
+        escape_prob = 1 - np.exp(-n_mutations * 0.5)  # Increasing escape
+        
+        ax.plot(n_mutations, fitness, 'b-', label='Viral Fitness', linewidth=2)
+        ax.plot(n_mutations, escape_prob * 100, 'r-', label='Escape Probability', linewidth=2)
+        ax.fill_between(n_mutations, 0, fitness, alpha=0.3, color='blue')
+        
+        ax.set_xlabel('Number of Mutations')
+        ax.set_ylabel('Percentage')
+        ax.set_title('Fitness Valley')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 4. Coverage by variant
+        ax = axes[1, 1]
+        
+        variant_names = [v.name for v in variants[:8]]
+        coverages = []
+        
+        for var in variants[:8]:
+            covered = sum(1 for ab in cocktail.antibodies 
+                         if ab.id not in var.escape_profile or 
+                         var.escape_profile[ab.id] < 5)
+            coverages.append(covered / len(cocktail.antibodies))
+        
+        bars = ax.bar(variant_names, coverages)
+        
+        # Color by coverage level
+        for bar, coverage in zip(bars, coverages):
+            if coverage > 0.8:
+                bar.set_color('green')
+            elif coverage > 0.5:
+                bar.set_color('yellow')
+            else:
+                bar.set_color('red')
+        
+        ax.set_xlabel('Variant')
+        ax.set_ylabel('Coverage')
+        ax.set_title('Variant Coverage')
+        ax.axhline(y=0.8, color='black', linestyle='--', alpha=0.5)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        plt.suptitle(f'Escape Landscape Analysis - {len(cocktail.antibodies)} Antibody Cocktail',
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+
+# ==========================================
+# 9. INTEGRATED PIPELINE
+# ==========================================
+
+class CocktailDesignPipeline:
+    """
+    Complete pipeline for cocktail design and optimization
+    """
+    
+    def __init__(self):
+        self.optimizer = CocktailOptimizer()
+        self.dose_optimizer = DoseOptimizer()
+        self.efficacy_predictor = ClinicalEfficacyPredictor()
+        self.visualizer = CocktailVisualizer()
+    
+    def design_optimal_cocktail(self,
+                               antibody_library: List[Antibody],
+                               variants: List[Variant],
+                               constraints: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Complete cocktail design pipeline
+        """
+        print("=" * 70)
+        print("ANTIBODY COCKTAIL OPTIMIZATION PIPELINE")
+        print("=" * 70)
+        
+        # 1. Optimize cocktail composition
+        print("\n1. Optimizing cocktail composition...")
+        candidates = self.optimizer.optimize_cocktail(
+            antibody_library, variants, constraints
+        )
+        print(f"   Generated {len(candidates)} cocktail candidates")
+        
+        # 2. Select best candidate
+        best_cocktail = candidates[0] if candidates else None
+        
+        if not best_cocktail:
+            print("No suitable cocktail found!")
+            return {}
+        
+        print(f"\n2. Best cocktail selected:")
+        print(f"   Antibodies: {', '.join([ab.id for ab in best_cocktail.antibodies])}")
+        print(f"   Coverage: {best_cocktail.coverage_score:.2%}")
+        print(f"   Resistance barrier: {best_cocktail.resistance_barrier:.2f}")
+        print(f"   Synergy: {best_cocktail.synergy_score:.2f}")
+        
+        # 3. Optimize dosing
+        print("\n3. Optimizing doses...")
+        optimal_doses = self.dose_optimizer.optimize_doses(best_cocktail)
+        
+        for ab_id, dose in optimal_doses.items():
+            print(f"   {ab_id}: {dose:.1f} mg")
+        
+        # 4. Predict clinical efficacy
+        print("\n4. Predicting clinical efficacy...")
+        efficacy_metrics = self.efficacy_predictor.predict_efficacy(best_cocktail)
+        
+        print(f"   Viral load reduction: {efficacy_metrics['viral_load_reduction']:.1f} log10")
+        print(f"   Hospitalization prevention: {efficacy_metrics['hospitalization_prevention']:.1%}")
+        print(f"   Symptom duration reduction: {efficacy_metrics['symptom_duration_reduction']:.1f} days")
+        
+        # 5. Generate visualizations
+        print("\n5. Generating visualizations...")
+        self.visualizer.plot_cocktail_comparison(candidates)
+        self.visualizer.plot_escape_landscape(best_cocktail, variants)
+        
+        # 6. Generate report
+        print("\n6. Generating report...")
+        report = self._generate_report(best_cocktail, optimal_doses, 
+                                      efficacy_metrics, variants)
+        
+        print("\n" + "=" * 70)
+        print("COCKTAIL DESIGN COMPLETE")
+        print("=" * 70)
+        
+        return {
+            'best_cocktail': best_cocktail,
+            'all_candidates': candidates,
+            'optimal_doses': optimal_doses,
+            'efficacy_metrics': efficacy_metrics,
+            'report': report
+        }
+    
+    def _generate_report(self, cocktail: CocktailCandidate,
+                        doses: Dict[str, float],
+                        efficacy: Dict[str, float],
+                        variants: List[Variant]) -> str:
+        """Generate comprehensive report"""
+        
+        report = f"""
+ANTIBODY COCKTAIL DESIGN REPORT
+================================
+Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+COCKTAIL COMPOSITION
+-------------------
+Number of antibodies: {len(cocktail.antibodies)}
+
+"""
+        for ab in cocktail.antibodies:
+            report += f"""
+Antibody: {ab.id}
+  - Epitope bin: {ab.epitope_bin}
+  - IC50: {ab.ic50:.2f} nM
+  - Breadth: {ab.neutralization_breadth:.2%}
+  - Production cost: ${ab.production_cost:.2f}/mg
+  - Stability: {ab.stability:.0f} days
+"""
+        
+        report += f"""
+OPTIMIZATION METRICS
+-------------------
+Coverage Score: {cocktail.coverage_score:.2%}
+Resistance Barrier: {cocktail.resistance_barrier:.2f}
+Synergy Score: {cocktail.synergy_score:.2f}
+Total Cost: ${cocktail.cost:.2f}
+Predicted Efficacy: {cocktail.predicted_efficacy:.2%}
+Escape Pathways Blocked: {cocktail.escape_pathways_blocked}
+
+OPTIMAL DOSING
+--------------
+"""
+        total_dose = 0
+        for ab_id, dose in doses.items():
+            report += f"  {ab_id}: {dose:.1f} mg\n"
+            total_dose += dose
+        
+        report += f"  Total dose: {total_dose:.1f} mg\n"
+        
+        report += f"""
+PREDICTED CLINICAL EFFICACY
+--------------------------
+Viral Load Reduction: {efficacy['viral_load_reduction']:.1f} log10
+Hospitalization Prevention: {efficacy['hospitalization_prevention']:.1%}
+Symptom Duration Reduction: {efficacy['symptom_duration_reduction']:.1f} days
+Transmission Reduction: {efficacy['transmission_reduction']:.1%}
+
+VARIANT COVERAGE
+---------------
+"""
+        # Calculate coverage for each variant
+        for variant in variants[:10]:
+            covered = sum(1 for ab in cocktail.antibodies 
+                         if ab.id not in variant.escape_profile or 
+                         variant.escape_profile[ab.id] < 5)
+            coverage_pct = covered / len(cocktail.antibodies) * 100
+            
+            status = "✓" if coverage_pct > 80 else "⚠" if coverage_pct > 50 else "✗"
+            report += f"  {status} {variant.name}: {coverage_pct:.0f}% coverage\n"
+        
+        report += """
+RECOMMENDATIONS
+--------------
+"""
+        
+        if cocktail.coverage_score > 0.9:
+            report += "• Excellent variant coverage - suitable for prophylaxis\n"
+        elif cocktail.coverage_score > 0.7:
+            report += "• Good coverage - suitable for treatment\n"
+        else:
+            report += "• Limited coverage - consider additional antibodies\n"
+        
+        if cocktail.resistance_barrier > 0.8:
+            report += "• High resistance barrier - durable efficacy expected\n"
+        elif cocktail.resistance_barrier > 0.5:
+            report += "• Moderate resistance barrier - monitor for escape\n"
+        else:
+            report += "• Low resistance barrier - rapid escape likely\n"
+        
+        if cocktail.synergy_score > 0.7:
+            report += "• Strong synergy - dose reduction possible\n"
+        
+        report += """
+GENERATED FILES
+--------------
+1. cocktail_comparison.html - Interactive comparison of candidates
+2. escape_landscape.png - Escape mutation analysis
+3. cocktail_report.txt - This report
+
+"""
+        
+        # Save report
+        with open("cocktail_report.txt", "w") as f:
+            f.write(report)
+        
+        print(report)
+        return report
+
+# ==========================================
+# 10. DEMONSTRATION
+# ==========================================
+
+def create_sample_data() -> Tuple[List[Antibody], List[Variant]]:
+    """Create sample data for demonstration"""
+    
+    # Create sample antibodies
+    antibodies = [
+        Antibody(
+            id="mAb001",
+            sequence="QVQLVQSGAEVKKPGS...",
+            epitope_bin="RBD-1",
+            ic50=5.0,
+            neutralization_breadth=0.85,
+            escape_mutations=["S:K417N", "S:K417T", "S:N501Y"],
+            production_cost=100,
+            stability=30,
+            immunogenicity_risk=0.1
+        ),
+        Antibody(
+            id="mAb002",
+            sequence="EVQLVESGGGLVQPGG...",
+            epitope_bin="RBD-2",
+            ic50=10.0,
+            neutralization_breadth=0.75,
+            escape_mutations=["S:E484K", "S:E484A", "S:L452R"],
+            production_cost=120,
+            stability=25,
+            immunogenicity_risk=0.15
+        ),
+        Antibody(
+            id="mAb003",
+            sequence="QVQLQQSGAELARPGA...",
+            epitope_bin="RBD-3",
+            ic50=8.0,
+            neutralization_breadth=0.70,
+            escape_mutations=["S:G446S", "S:Q493R"],
+            production_cost=90,
+            stability=35,
+            immunogenicity_risk=0.08
+        ),
+        Antibody(
+            id="mAb004",
+            sequence="DVQLVQSGAEVKKPGA...",
+            epitope_bin="NTD-1",
+            ic50=15.0,
+            neutralization_breadth=0.65,
+            escape_mutations=["S:del144", "S:Y145D"],
+            production_cost=110,
+            stability=28,
+            immunogenicity_risk=0.12
+        ),
+        Antibody(
+            id="mAb005",
+            sequence="QVTLKESGPVLVKPTE...",
+            epitope_bin="S2-1",
+            ic50=20.0,
+            neutralization_breadth=0.90,
+            escape_mutations=[],  # Highly conserved
+            production_cost=150,
+            stability=40,
+            immunogenicity_risk=0.05
+        )
+    ]
+    
+    # Create sample variants
+    variants = [
+        Variant(
+            name="Alpha",
+            mutations=["S:N501Y", "S:D614G"],
+            prevalence=0.1,
+            growth_rate=0.2,
+            geographic_distribution=["UK", "USA"],
+            escape_profile={"mAb001": 5.0, "mAb002": 1.0}
+        ),
+        Variant(
+            name="Beta",
+            mutations=["S:K417N", "S:E484K", "S:N501Y"],
+            prevalence=0.15,
+            growth_rate=0.3,
+            geographic_distribution=["South Africa", "Europe"],
+            escape_profile={"mAb001": 10.0, "mAb002": 8.0}
+        ),
+        Variant(
+            name="Delta",
+            mutations=["S:L452R", "S:T478K"],
+            prevalence=0.3,
+            growth_rate=0.5,
+            geographic_distribution=["India", "Global"],
+            escape_profile={"mAb002": 6.0, "mAb003": 2.0}
+        ),
+        Variant(
+            name="Omicron",
+            mutations=["S:K417N", "S:E484A", "S:N501Y", "S:G446S"],
+            prevalence=0.4,
+            growth_rate=0.8,
+            geographic_distribution=["Global"],
+            escape_profile={"mAb001": 15.0, "mAb002": 12.0, "mAb003": 8.0}
+        )
+    ]
+    
+    return antibodies, variants
+
+def demo_cocktail_optimization():
+    """Demonstrate cocktail optimization"""
+    
+    print("Creating sample data...")
+    antibodies, variants = create_sample_data()
+    
+    print(f"Generated {len(antibodies)} antibodies and {len(variants)} variants")
+    
+    # Define constraints
+    constraints = {
+        'max_antibodies': 3,
+        'max_cost': 400,
+        'min_coverage': 0.7
+    }
+    
+    # Run optimization
+    pipeline = CocktailDesignPipeline()
+    results = pipeline.design_optimal_cocktail(
+        antibodies, variants, constraints
+    )
+    
+    print("\n✓ Cocktail optimization complete!")
+    print("Check generated files for detailed results.")
+    
+    return results
+
+if __name__ == "__main__":
+    results = demo_cocktail_optimization()

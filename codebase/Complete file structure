@@ -1,0 +1,20 @@
+berean-protocol/
+├── Core Modules/
+│   ├── berean_protocol_fixed.py          # Binding prediction
+│   ├── antibody_research_module.py       # CDR/epitope analysis
+│   ├── variant_analysis_module.py        # Variant resistance
+│   ├── gisaid_variant_tracker.py        # Real-time surveillance
+│   ├── antibody_cocktail_optimizer.py   # Cocktail design
+│   └── structural_escape_modeling.py    # NEW: Structural analysis
+├── Integration/
+│   ├── integrated_antibody_platform.py  # Complete pipeline
+│   └── complete_platform_demo.py        # Full demonstration
+├── Documentation/
+│   ├── COMPLETE_USER_GUIDE.md
+│   ├── GISAID_INTEGRATION_GUIDE.md
+│   └── STRUCTURAL_INTEGRATION_GUIDE.md
+└── Output/
+    ├── structural_reports/
+    ├── pymol_scripts/
+    └── interactive_visualizations/
+    

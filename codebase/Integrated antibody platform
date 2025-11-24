@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+BEREAN PROTOCOL: Complete Antibody Discovery Platform
+Integrated workflow combining all modules for end-to-end antibody development
+
+This script demonstrates the complete pipeline from discovery to clinical candidate
+
+Author: EJ
+Date: November 2024
+"""
+
+import os
+import json
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+import matplotlib.pyplot as plt
+import seaborn as sns
+from dataclasses import dataclass
+import warnings
+warnings.filterwarnings('ignore')
+
+# Import all modules (in production, these would be proper imports)
+# from berean_protocol_fixed import OmniSynapticBindingPredictor
+# from antibody_research_module import AntibodyAnalysisPipeline
+# from variant_analysis_module import VariantAnalyzer
+# from gisaid_variant_tracker import GISAIDAnalysisPipeline
+# from antibody_cocktail_optimizer import CocktailDesignPipeline, Antibody, Variant
+
+# ==========================================
+# 1. INTEGRATED PLATFORM CONFIGURATION
+# ==========================================
+
+@dataclass
+class PlatformConfig:
+    """Central configuration for the entire platform"""
+    
+    # Module settings
+    binding_threshold: float = 0.7
+    variant_coverage_minimum: float = 0.8
+    cocktail_size_max: int = 3
+    
+    # GISAID settings
+    gisaid_update_frequency: str = "daily"
+    emerging_threat_threshold: float = 0.5
+    
+    # Optimization weights
+    optimization_priorities: Dict[str, float] = None
+    
+    # Output settings
+    output_directory: str = "./antibody_discovery_output"
+    generate_reports: bool = True
+    
+    def __post_init__(self):
+        if self.optimization_priorities is None:
+            self.optimization_priorities = {
+                'efficacy': 0.35,
+                'breadth': 0.25,
+                'resistance': 0.20,
+                'manufacturability': 0.10,
+                'safety': 0.10
+            }
+
+# ==========================================
+# 2. COMPLETE DISCOVERY WORKFLOW
+# ==========================================
+
+class AntibodyDiscoveryPlatform:
+    """
+    Integrated platform for complete antibody discovery and optimization
+    """
+    
+    def __init__(self, config: PlatformConfig = None):
+        self.config = config or PlatformConfig()
+        
+        # Initialize all modules
+        self.modules = {
+            'binding': None,  # OmniSynapticBindingPredictor()
+            'analysis': None,  # AntibodyAnalysisPipeline()
+            'variants': None,  # VariantAnalyzer()
+            'gisaid': None,  # GISAIDAnalysisPipeline()
+            'cocktail': None  # CocktailDesignPipeline()
+        }
+        
+        # Create output directories
+        os.makedirs(self.config.output_directory, exist_ok=True)
+        for subdir in ['binding', 'variants', 'cocktails', 'reports']:
+            os.makedirs(os.path.join(self.config.output_directory, subdir), exist_ok=True)
+        
+        self.pipeline_results = {}
+    
+    def run_complete_pipeline(self,
+                             antibody_sequences: List[str],
+                             antigen_sequences: List[str],
+                             gisaid_metadata: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Execute complete antibody discovery pipeline
+        """
+        print("=" * 80)
+        print("BEREAN PROTOCOL: COMPLETE ANTIBODY DISCOVERY PIPELINE")
+        print("=" * 80)
+        print(f"Starting analysis at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Analyzing {len(antibody_sequences)} antibody candidates")
+        
+        # Phase 1: Initial Screening
+        print("\n" + "="*60)
+        print("PHASE 1: INITIAL ANTIBODY SCREENING")
+        print("="*60)
+        screening_results = self._phase1_screening(antibody_sequences, antigen_sequences)
+        
+        # Phase 2: Detailed Characterization
+        print("\n" + "="*60)
+        print("PHASE 2: DETAILED CHARACTERIZATION")
+        print("="*60)
+        characterization_results = self._phase2_characterization(
+            screening_results['passed_antibodies']
+        )
+        
+        # Phase 3: Variant Analysis
+        print("\n" + "="*60)
+        print("PHASE 3: VARIANT RESISTANCE ANALYSIS")
+        print("="*60)
+        variant_results = self._phase3_variant_analysis(
+            characterization_results['characterized_antibodies'],
+            gisaid_metadata
+        )
+        
+        # Phase 4: Cocktail Optimization
+        print("\n" + "="*60)
+        print("PHASE 4: COCKTAIL DESIGN & OPTIMIZATION")
+        print("="*60)
+        cocktail_results = self._phase4_cocktail_optimization(
+            variant_results['resistant_antibodies']
+        )
+        
+        # Phase 5: Clinical Development Planning
+        print("\n" + "="*60)
+        print("PHASE 5: CLINICAL DEVELOPMENT PLANNING")
+        print("="*60)
+        development_plan = self._phase5_development_planning(
+            cocktail_results['optimal_cocktail']
+        )
+        
+        # Generate comprehensive report
+        self._generate_master_report(
+            screening_results,
+            characterization_results,
+            variant_results,
+            cocktail_results,
+            development_plan
+        )
+        
+        print("\n" + "="*80)
+        print("PIPELINE COMPLETE")
+        print("="*80)
+        
+        return {
+            'screening': screening_results,
+            'characterization': characterization_results,
+            'variants': variant_results,
+            'cocktails': cocktail_results,
+            'development': development_plan,
+            'summary': self._generate_summary(cocktail_results)
+        }
+    
+    def _phase1_screening(self, 
+                         antibody_sequences: List[str],
+                         antigen_sequences: List[str]) -> Dict:
+        """
+        Phase 1: Initial binding and specificity screening
+        """
+        results = {
+            'total_screened': len(antibody_sequences),
+            'passed_antibodies': [],
+            'binding_scores': {},
+            'specificity_scores': {}
+        }
+        
+        print("\n1.1 Binding Prediction")
+        print("-" * 40)
+        
+        for i, ab_seq in enumerate(antibody_sequences):
+            # Simulate binding prediction
+            binding_score = np.random.uniform(0.4, 0.95)  # Mock score
+            specificity = np.random.uniform(0.6, 0.99)
+            
+            results['binding_scores'][f'Ab_{i+1}'] = binding_score
+            results['specificity_scores'][f'Ab_{i+1}'] = specificity
+            
+            if binding_score > self.config.binding_threshold:
+                results['passed_antibodies'].append({
+                    'id': f'Ab_{i+1}',
+                    'sequence': ab_seq,
+                    'binding_score': binding_score,
+                    'specificity': specificity
+                })
+                print(f"   Ab_{i+1}: PASSED (Binding: {binding_score:.3f})")
+            else:
+                print(f"   Ab_{i+1}: FAILED (Binding: {binding_score:.3f})")
+        
+        print(f"\n   Summary: {len(results['passed_antibodies'])}/{len(antibody_sequences)} passed screening")
+        
+        # Cross-reactivity check
+        print("\n1.2 Cross-reactivity Assessment")
+        print("-" * 40)
+        
+        # Simulate cross-reactivity testing
+        for ab in results['passed_antibodies']:
+            cross_reactive_antigens = np.random.randint(0, 3)
+            ab['cross_reactivity'] = cross_reactive_antigens
+            
+            if cross_reactive_antigens == 0:
+                print(f"   {ab['id']}: No cross-reactivity detected ✓")
+            else:
+                print(f"   {ab['id']}: Cross-reactive with {cross_reactive_antigens} antigens ⚠")
+        
+        return results
+    
+    def _phase2_characterization(self, antibodies: List[Dict]) -> Dict:
+        """
+        Phase 2: Detailed molecular characterization
+        """
+        results = {
+            'characterized_antibodies': [],
+            'cdr_analysis': {},
+            'epitope_bins': {},
+            'developability_scores': {}
+        }
+        
+        print("\n2.1 CDR Analysis")
+        print("-" * 40)
+        
+        for ab in antibodies:
+            # Simulate CDR analysis
+            cdr_lengths = {
+                'CDR-H1': np.random.randint(5, 12),
+                'CDR-H2': np.random.randint(16, 19),
+                'CDR-H3': np.random.randint(3, 25),
+                'CDR-L1': np.random.randint(10, 17),
+                'CDR-L2': np.random.randint(7, 11),
+                'CDR-L3': np.random.randint(7, 11)
+            }
+            
+            results['cdr_analysis'][ab['id']] = cdr_lengths
+            print(f"   {ab['id']}: CDR-H3 length = {cdr_lengths['CDR-H3']} aa")
+        
+        print("\n2.2 Epitope Binning")
+        print("-" * 40)
+        
+        epitope_bins = ['RBD-1', 'RBD-2', 'RBD-3', 'RBD-4', 'NTD-1', 'S2-1']
+        
+        for ab in antibodies:
+            # Assign epitope bin
+            ab['epitope_bin'] = np.random.choice(epitope_bins)
+            results['epitope_bins'][ab['id']] = ab['epitope_bin']
+            print(f"   {ab['id']}: {ab['epitope_bin']}")
+        
+        print("\n2.3 Developability Assessment")
+        print("-" * 40)
+        
+        for ab in antibodies:
+            # Calculate developability metrics
+            developability = {
+                'stability': np.random.uniform(0.7, 0.95),
+                'solubility': np.random.uniform(0.6, 0.95),
+                'aggregation_risk': np.random.uniform(0.05, 0.3),
+                'immunogenicity_risk': np.random.uniform(0.05, 0.25),
+                'expression_yield': np.random.uniform(50, 200)  # mg/L
+            }
+            
+            # Overall developability score
+            dev_score = (
+                developability['stability'] * 0.25 +
+                developability['solubility'] * 0.25 +
+                (1 - developability['aggregation_risk']) * 0.25 +
+                (1 - developability['immunogenicity_risk']) * 0.15 +
+                developability['expression_yield'] / 200 * 0.10
+            )
+            
+            developability['overall_score'] = dev_score
+            results['developability_scores'][ab['id']] = developability
+            
+            if dev_score > 0.7:
+                ab['developability'] = developability
+                results['characterized_antibodies'].append(ab)
+                print(f"   {ab['id']}: PASSED (Score: {dev_score:.3f})")
+            else:
+                print(f"   {ab['id']}: FAILED (Score: {dev_score:.3f})")
+        
+        print(f"\n   Summary: {len(results['characterized_antibodies'])}/{len(antibodies)} passed characterization")
+        
+        return results
+    
+    def _phase3_variant_analysis(self, 
+                                antibodies: List[Dict],
+                                gisaid_metadata: Optional[str] = None) -> Dict:
+        """
+        Phase 3: Variant resistance and escape analysis
+        """
+        results = {
+            'resistant_antibodies': [],
+            'variant_coverage': {},
+            'escape_mutations': {},
+            'emerging_threats': []
+        }
+        
+        # Define test variants
+        test_variants = ['Alpha', 'Beta', 'Delta', 'Omicron BA.1', 'Omicron BA.2', 
+                        'Omicron BA.5', 'XBB.1.5', 'JN.1']
+        
+        print("\n3.1 Known Variant Neutralization")
+        print("-" * 40)
+        
+        for ab in antibodies:
+            neutralization_profile = {}
+            
+            for variant in test_variants:
+                # Simulate neutralization
+                if ab['epitope_bin'] in ['RBD-1', 'RBD-2']:
+                    # RBD antibodies affected by variants
+                    if 'Omicron' in variant or 'XBB' in variant:
+                        neutralization = np.random.uniform(0.2, 0.6)
+                    else:
+                        neutralization = np.random.uniform(0.6, 0.95)
+                elif ab['epitope_bin'] == 'S2-1':
+                    # S2 antibodies more conserved
+                    neutralization = np.random.uniform(0.7, 0.95)
+                else:
+                    neutralization = np.random.uniform(0.4, 0.8)
+                
+                neutralization_profile[variant] = neutralization
+            
+            # Calculate breadth
+            breadth = sum(1 for n in neutralization_profile.values() if n > 0.5) / len(test_variants)
+            ab['neutralization_breadth'] = breadth
+            ab['variant_neutralization'] = neutralization_profile
+            
+            results['variant_coverage'][ab['id']] = breadth
+            
+            print(f"   {ab['id']}: Breadth = {breadth:.1%} ({sum(1 for n in neutralization_profile.values() if n > 0.5)}/{len(test_variants)} variants)")
+        
+        print("\n3.2 Escape Mutation Analysis")
+        print("-" * 40)
+        
+        key_mutations = {
+            'K417N/T': 'RBD-1',
+            'L452R/Q': 'RBD-2',
+            'E484K/A/Q': 'RBD-2',
+            'N501Y': 'RBD-1',
+            'Q493R': 'RBD-3',
+            'G446S': 'RBD-3',
+            'F486V/P': 'RBD-2'
+        }
+        
+        for ab in antibodies:
+            escape_mutations = []
+            
+            for mutation, affected_bin in key_mutations.items():
+                if ab['epitope_bin'] == affected_bin:
+                    if np.random.random() < 0.6:  # 60% chance of escape
+                        escape_mutations.append(mutation)
+            
+            ab['escape_mutations'] = escape_mutations
+            results['escape_mutations'][ab['id']] = escape_mutations
+            
+            print(f"   {ab['id']}: {len(escape_mutations)} escape pathways identified")
+        
+        if gisaid_metadata:
+            print("\n3.3 GISAID Real-time Surveillance")
+            print("-" * 40)
+            
+            # Simulate GISAID analysis
+            emerging_variants = [
+                {'name': 'BA.2.87', 'growth_rate': 0.8, 'countries': 12},
+                {'name': 'XBB.1.16.1', 'growth_rate': 0.6, 'countries': 8},
+                {'name': 'JN.1.1', 'growth_rate': 0.9, 'countries': 15}
+            ]
+            
+            results['emerging_threats'] = emerging_variants
+            
+            for variant in emerging_variants:
+                print(f"   {variant['name']}: Growth rate {variant['growth_rate']:.2f}, "
+                     f"detected in {variant['countries']} countries")
+        
+        # Filter antibodies by breadth
+        for ab in antibodies:
+            if ab['neutralization_breadth'] > self.config.variant_coverage_minimum:
+                results['resistant_antibodies'].append(ab)
+        
+        print(f"\n   Summary: {len(results['resistant_antibodies'])}/{len(antibodies)} meet breadth criteria")
+        
+        return results
+    
+    def _phase4_cocktail_optimization(self, antibodies: List[Dict]) -> Dict:
+        """
+        Phase 4: Cocktail design and optimization
+        """
+        results = {
+            'cocktail_candidates': [],
+            'optimal_cocktail': None,
+            'synergy_analysis': {},
+            'resistance_barrier': {}
+        }
+        
+        print("\n4.1 Epitope Complementarity Analysis")
+        print("-" * 40)
+        
+        # Group antibodies by epitope bin
+        epitope_groups = {}
+        for ab in antibodies:
+            bin = ab['epitope_bin']
+            if bin not in epitope_groups:
+                epitope_groups[bin] = []
+            epitope_groups[bin].append(ab)
+        
+        print(f"   Epitope diversity: {len(epitope_groups)} distinct bins")
+        for bin, abs in epitope_groups.items():
+            print(f"   {bin}: {len(abs)} antibodies")
+        
+        print("\n4.2 Generating Cocktail Combinations")
+        print("-" * 40)
+        
+        # Generate cocktail combinations
+        from itertools import combinations
+        
+        max_size = min(self.config.cocktail_size_max, len(antibodies))
+        
+        for size in range(2, max_size + 1):
+            for combo in combinations(antibodies, size):
+                # Check epitope diversity
+                epitopes = set(ab['epitope_bin'] for ab in combo)
+                
+                if len(epitopes) >= size - 1:  # Allow max 1 overlap
+                    cocktail = {
+                        'antibodies': combo,
+                        'size': size,
+                        'epitope_diversity': len(epitopes),
+                        'id': f"Cocktail_{len(results['cocktail_candidates'])+1}"
+                    }
+                    results['cocktail_candidates'].append(cocktail)
+        
+        print(f"   Generated {len(results['cocktail_candidates'])} candidate cocktails")
+        
+        print("\n4.3 Cocktail Scoring")
+        print("-" * 40)
+        
+        for cocktail in results['cocktail_candidates']:
+            # Calculate cocktail metrics
+            
+            # Coverage: best neutralization across variants
+            variant_coverage = {}
+            for variant in ['Alpha', 'Beta', 'Delta', 'Omicron BA.1']:
+                best_neutralization = max(
+                    ab['variant_neutralization'].get(variant, 0) 
+                    for ab in cocktail['antibodies']
+                )
+                variant_coverage[variant] = best_neutralization
+            
+            cocktail['coverage_score'] = np.mean(list(variant_coverage.values()))
+            
+            # Synergy score (based on epitope diversity)
+            cocktail['synergy_score'] = cocktail['epitope_diversity'] / cocktail['size']
+            
+            # Resistance barrier (number of mutations needed to escape all)
+            all_escape_mutations = set()
+            for ab in cocktail['antibodies']:
+                all_escape_mutations.update(ab.get('escape_mutations', []))
+            
+            cocktail['resistance_barrier'] = len(all_escape_mutations) / 10  # Normalized
+            
+            # Cost (simulated)
+            cocktail['cost'] = sum(
+                
